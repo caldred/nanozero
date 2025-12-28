@@ -28,17 +28,18 @@ pip install -q torch numpy
 echo ""
 echo "Starting training..."
 echo "Game: TicTacToe"
-echo "Config: n_layer=2, 50 iterations, 100 games/iter"
+echo "Config: n_layer=2, 50 iterations, 20 games/iter, 250 training steps"
 echo ""
 
 python -m scripts.train \
     --game=tictactoe \
     --n_layer=2 \
     --num_iterations=50 \
-    --games_per_iteration=100 \
-    --training_steps=50 \
+    --games_per_iteration=20 \
+    --training_steps=250 \
     --mcts_simulations=25 \
     --batch_size=64 \
+    --buffer_size=10000 \
     --eval_interval=10 \
     --checkpoint_interval=25
 
