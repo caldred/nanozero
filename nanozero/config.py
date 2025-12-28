@@ -1,0 +1,86 @@
+"""
+nanozero/config.py - Configuration dataclasses
+"""
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class GameConfig:
+    """Configuration for a game."""
+    name: str
+    board_height: int
+    board_width: int
+    action_size: int
+    num_players: int = 2
+
+    @property
+    def board_size(self) -> int:
+        return self.board_height * self.board_width
+
+@dataclass
+class ModelConfig:
+    """Configuration for the Transformer model."""
+    board_size: int
+    action_size: int
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 128
+    dropout: float = 0.0
+
+    def __post_init__(self):
+        # Scale embedding dim with depth (like nanochat)
+        if self.n_embd == 128:
+            self.n_embd = max(64, 64 * self.n_layer)
+        assert self.n_embd % self.n_head == 0
+
+@dataclass
+class MCTSConfig:
+    """Configuration for Monte Carlo Tree Search."""
+    num_simulations: int = 100
+    c_puct: float = 1.0
+    dirichlet_alpha: float = 0.3
+    dirichlet_epsilon: float = 0.25
+    temperature: float = 1.0
+
+@dataclass
+class TrainConfig:
+    """Configuration for training loop."""
+    num_iterations: int = 100
+    games_per_iteration: int = 100
+    training_steps: int = 100
+    batch_size: int = 64
+    buffer_size: int = 100000
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    checkpoint_interval: int = 10
+    eval_interval: int = 10
+    mcts_simulations: int = 50
+    temperature_threshold: int = 15
+
+def get_game_config(name: str) -> GameConfig:
+    """Get predefined game configuration."""
+    configs = {
+        'tictactoe': GameConfig(
+            name='tictactoe',
+            board_height=3,
+            board_width=3,
+            action_size=9,
+        ),
+        'connect4': GameConfig(
+            name='connect4',
+            board_height=6,
+            board_width=7,
+            action_size=7,
+        ),
+    }
+    if name not in configs:
+        raise ValueError(f"Unknown game: {name}")
+    return configs[name]
+
+def get_model_config(game_config: GameConfig, n_layer: int = 4) -> ModelConfig:
+    """Get model configuration for a game."""
+    return ModelConfig(
+        board_size=game_config.board_size,
+        action_size=game_config.action_size,
+        n_layer=n_layer,
+    )

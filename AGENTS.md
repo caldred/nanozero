@@ -1,6 +1,6 @@
 # NanoZero: Sub-Agent Assignment Summary
 
-Quick reference for implementation. Full specs in `SPEC.md` and `SPEC_PART2.md`.
+Quick reference for implementation. Full specs in `FULL_SPEC.md`
 
 ## Project Overview
 
