@@ -105,7 +105,7 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15):
     return all_examples
 
 
-def train_step(model, optimizer, states, policies, values, device):
+def train_step(model, optimizer, states, policies, values, action_masks, device):
     """
     Perform a single training step.
 
@@ -115,6 +115,7 @@ def train_step(model, optimizer, states, policies, values, device):
         states: Batch of state tensors (B, board_size)
         policies: Batch of policy targets (B, action_size)
         values: Batch of value targets (B,)
+        action_masks: Batch of legal action masks (B, action_size)
         device: Torch device
 
     Returns:
@@ -125,9 +126,10 @@ def train_step(model, optimizer, states, policies, values, device):
     states = states.to(device)
     policies = policies.to(device)
     values = values.to(device)
+    action_masks = action_masks.to(device)
 
     # Forward pass
-    pred_log_policies, pred_values = model(states)
+    pred_log_policies, pred_values = model(states, action_masks)
 
     # Policy loss: cross-entropy (using log-softmax output)
     policy_loss = -torch.mean(torch.sum(policies * pred_log_policies, dim=1))
@@ -341,12 +343,16 @@ def main():
                 ])
                 policy_tensors = torch.from_numpy(policies).float()
                 value_tensors = torch.from_numpy(values).float()
+                action_mask_tensors = torch.stack([
+                    torch.from_numpy(game.legal_actions_mask(s))
+                    for s in states
+                ]).float()
 
                 # Train step
                 loss, policy_loss, value_loss = train_step(
                     model, optimizer,
                     state_tensors, policy_tensors, value_tensors,
-                    device
+                    action_mask_tensors, device
                 )
 
                 loss_meter.update(loss)

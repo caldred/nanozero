@@ -93,7 +93,12 @@ class AlphaZeroTransformer(nn.Module):
         pooled = x.mean(dim=1)
         logits = self.policy_head(pooled)
         if action_mask is not None:
-            logits = logits.masked_fill(action_mask == 0, float('-inf'))
+            mask = action_mask.bool()
+            logits = logits.masked_fill(~mask, -1e9)  # keep illegal moves far from softmax
+            # Fallback: if a row is fully masked (shouldn't happen), avoid NaNs by zeroing logits
+            fully_masked = (~mask).all(dim=-1)
+            if fully_masked.any():
+                logits[fully_masked] = 0
         policy = F.log_softmax(logits, dim=-1)
         value = self.value_head(pooled)
         return policy, value
