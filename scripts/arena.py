@@ -69,9 +69,9 @@ def arena(
         final_player = game.current_player(state)
 
         if final_player == p1_turn:
-            p1_result = -reward
-        else:
             p1_result = reward
+        else:
+            p1_result = -reward
 
         if p1_result > 0:
             wins += 1

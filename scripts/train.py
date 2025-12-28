@@ -63,11 +63,11 @@ def self_play_game(game, model, mcts, temperature_threshold=15):
     # Assign values to all examples
     training_examples = []
     for canonical, policy, player in examples:
-        # Value from this player's perspective
+        # Value from this player's perspective (reward is from final player's view)
         if player == final_player:
-            value = -reward  # Opponent just moved, so negate
-        else:
             value = reward
+        else:
+            value = -reward
         training_examples.append((canonical, policy, value))
 
     return training_examples
@@ -195,9 +195,9 @@ def evaluate_vs_random(game, model, mcts, num_games=50, mcts_simulations=25):
         final_player = game.current_player(state)
 
         if final_player == model_player:
-            model_result = -reward
-        else:
             model_result = reward
+        else:
+            model_result = -reward
 
         if model_result > 0:
             wins += 1

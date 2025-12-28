@@ -41,9 +41,9 @@ def play_game(game, player1_fn, player2_fn):
     reward = game.terminal_reward(state)
     final_player = game.current_player(state)
     if final_player == 1:
-        return -reward  # Player 2 just moved
+        return reward  # Player 1 would move next (from their perspective)
     else:
-        return reward  # Player 1 just moved
+        return -reward  # Player 2 would move next
 
 
 def make_random_player(game):

@@ -73,9 +73,9 @@ def play_interactive(game, model, mcts, human_first: bool = True):
 
     # Determine winner from human's perspective
     if final_player == human_player:
-        human_result = -reward
-    else:
         human_result = reward
+    else:
+        human_result = -reward
 
     if human_result > 0:
         print("You win!")
