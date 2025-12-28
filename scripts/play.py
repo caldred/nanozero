@@ -52,9 +52,8 @@ def play_interactive(game, model, mcts, human_first: bool = True):
             action = get_human_action(game, state)
         else:
             print("\nAI is thinking...")
-            canonical = game.canonical_state(state)
             policy = mcts.search(
-                canonical[np.newaxis, ...],
+                state[np.newaxis, ...],
                 model,
                 num_simulations=100,
                 add_noise=False

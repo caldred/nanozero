@@ -57,9 +57,8 @@ def make_random_player(game):
 def make_mcts_player(game, model, mcts, num_simulations=50):
     """Create an MCTS player function."""
     def play(state):
-        canonical = game.canonical_state(state)
         policy = mcts.search(
-            canonical[np.newaxis, ...],
+            state[np.newaxis, ...],
             model,
             num_simulations=num_simulations,
             add_noise=False

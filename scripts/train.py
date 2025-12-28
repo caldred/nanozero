@@ -37,18 +37,18 @@ def self_play_game(game, model, mcts, temperature_threshold=15):
     move_count = 0
 
     while not game.is_terminal(state):
-        canonical = game.canonical_state(state)
         player = game.current_player(state)
 
-        # Run MCTS to get policy
+        # Run MCTS on the real state; canonicalize only for storage
         temperature = 1.0 if move_count < temperature_threshold else 0.0
         policy = mcts.search(
-            canonical[np.newaxis, ...],
+            state[np.newaxis, ...],
             model,
             add_noise=(move_count == 0)  # Add noise only at root
         )[0]
 
         # Store example (without value yet - we'll add it at the end)
+        canonical = game.canonical_state(state)
         examples.append((canonical.copy(), policy.copy(), player))
 
         # Sample action

@@ -96,7 +96,7 @@ class MCTS:
         Run MCTS from a given state.
 
         Args:
-            state: Game state (canonical form, current player's pieces are +1)
+            state: Game state (raw board values)
             model: Neural network for policy/value prediction
             num_simulations: Number of MCTS simulations (default from config)
             add_noise: Whether to add Dirichlet noise at root (for exploration)
@@ -110,7 +110,7 @@ class MCTS:
         root = Node()
         device = next(model.parameters()).device
 
-        # Expand root node
+        # Expand root node (canonicalize internally)
         self._expand(root, state, model, device)
 
         # Add Dirichlet noise to root for exploration
@@ -127,8 +127,6 @@ class MCTS:
             while node.expanded() and not self.game.is_terminal(current_state):
                 action, node = self._select_child(node)
                 current_state = self.game.next_state(current_state, action)
-                # Flip perspective for next player
-                current_state = -current_state
                 search_path.append(node)
 
             # Get value for leaf
@@ -167,8 +165,9 @@ class MCTS:
         # Get legal actions
         legal_actions = self.game.legal_actions(state)
 
-        # Get policy and value from network
-        state_tensor = self.game.to_tensor(state).unsqueeze(0).to(device)
+        # Get policy and value from network (canonical perspective)
+        canonical = self.game.canonical_state(state)
+        state_tensor = self.game.to_tensor(canonical).unsqueeze(0).to(device)
         action_mask = torch.from_numpy(
             self.game.legal_actions_mask(state)
         ).unsqueeze(0).float().to(device)
@@ -289,7 +288,7 @@ class BatchedMCTS:
         Run batched MCTS on multiple states.
 
         Args:
-            states: Batch of game states, shape (B, H, W), canonical form
+            states: Batch of game states, shape (B, H, W), raw board values
             model: Neural network for policy/value prediction
             num_simulations: Number of MCTS simulations per state
             add_noise: Whether to add Dirichlet noise at roots
@@ -334,7 +333,6 @@ class BatchedMCTS:
                 while node.expanded() and not self.game.is_terminal(current_state):
                     action, node = self._select_child(node)
                     current_state = self.game.next_state(current_state, action)
-                    current_state = -current_state  # Flip perspective
                     search_path.append(node)
 
                 search_paths.append(search_path)
@@ -390,9 +388,9 @@ class BatchedMCTS:
         """
         batch_size = len(nodes)
 
-        # Prepare batch tensors
+        # Prepare batch tensors (canonical perspective for each state)
         state_tensors = torch.stack([
-            self.game.to_tensor(states[i]) for i in range(batch_size)
+            self.game.to_tensor(self.game.canonical_state(states[i])) for i in range(batch_size)
         ]).to(device)
 
         action_masks = torch.stack([
@@ -434,9 +432,9 @@ class BatchedMCTS:
         """
         batch_size = len(nodes)
 
-        # Prepare batch tensors
+        # Prepare batch tensors (canonical perspective for each state)
         state_tensors = torch.stack([
-            self.game.to_tensor(states[i]) for i in range(batch_size)
+            self.game.to_tensor(self.game.canonical_state(states[i])) for i in range(batch_size)
         ]).to(device)
 
         action_masks = torch.stack([

@@ -32,9 +32,8 @@ def arena(
 
     def make_player(model, mcts):
         def play(state):
-            canonical = game.canonical_state(state)
             policy = mcts.search(
-                canonical[np.newaxis, ...],
+                state[np.newaxis, ...],
                 model,
                 num_simulations=mcts_simulations,
                 add_noise=False
