@@ -263,35 +263,43 @@ class BatchedMCTS:
     Batched MCTS for GPU-efficient search.
 
     Runs MCTS on multiple game states in parallel, batching neural network
-    evaluations for better GPU utilization.
+    evaluations for better GPU utilization. Uses virtual loss to enable
+    parallel simulations within each search.
     """
 
-    def __init__(self, game: Game, config: MCTSConfig):
+    def __init__(self, game: Game, config: MCTSConfig, virtual_loss: float = 1.0):
         """
         Initialize batched MCTS.
 
         Args:
             game: Game instance
             config: MCTS configuration
+            virtual_loss: Virtual loss value to apply during parallel selection
         """
         self.game = game
         self.config = config
+        self.virtual_loss = virtual_loss
 
     def search(
         self,
         states: np.ndarray,
         model: torch.nn.Module,
         num_simulations: Optional[int] = None,
-        add_noise: bool = True
+        add_noise: bool = True,
+        batch_size: int = 8
     ) -> np.ndarray:
         """
-        Run batched MCTS on multiple states.
+        Run batched MCTS on multiple states with virtual loss parallelism.
+
+        Uses virtual loss to run multiple simulations in parallel within each
+        search, batching their neural network calls together.
 
         Args:
             states: Batch of game states, shape (B, H, W), raw board values
             model: Neural network for policy/value prediction
             num_simulations: Number of MCTS simulations per state
             add_noise: Whether to add Dirichlet noise at roots
+            batch_size: Number of simulations to batch together per state
 
         Returns:
             Policy array of shape (B, action_size)
@@ -299,11 +307,11 @@ class BatchedMCTS:
         if num_simulations is None:
             num_simulations = self.config.num_simulations
 
-        batch_size = states.shape[0]
+        num_states = states.shape[0]
         device = next(model.parameters()).device
 
         # Create root nodes for each state
-        roots = [Node() for _ in range(batch_size)]
+        roots = [Node() for _ in range(num_states)]
 
         # Initial expansion of all roots
         self._batch_expand(roots, states, model, device)
@@ -314,58 +322,93 @@ class BatchedMCTS:
                 if root.expanded():
                     self._add_dirichlet_noise(root)
 
-        # Run simulations
-        for _ in range(num_simulations):
-            # For each state in batch, traverse to leaf
-            nodes = []
-            search_paths = []
-            leaf_states = []
-            leaf_indices = []  # Track which batch element this leaf belongs to
-            terminal_values = []  # Store terminal values for terminal states
-            terminal_indices = []  # Track which batch elements hit terminal
+        # Run simulations in batches
+        sims_done = 0
+        while sims_done < num_simulations:
+            # How many simulations to run this batch
+            sims_this_batch = min(batch_size, num_simulations - sims_done)
 
-            for i, (root, state) in enumerate(zip(roots, states)):
-                node = root
-                search_path = [node]
-                current_state = state.copy()
+            # Collect leaves from all states and all parallel sims
+            all_search_paths = []  # (state_idx, search_path)
+            all_leaf_states = []
+            all_leaf_info = []  # (state_idx, path_idx)
+            all_terminal_info = []  # (state_idx, path_idx, value)
 
-                # SELECT: traverse to leaf
-                while node.expanded() and not self.game.is_terminal(current_state):
-                    action, node = self._select_child(node)
-                    current_state = self.game.next_state(current_state, action)
-                    search_path.append(node)
+            for state_idx, (root, state) in enumerate(zip(roots, states)):
+                for sim_idx in range(sims_this_batch):
+                    node = root
+                    search_path = [node]
+                    current_state = state.copy()
 
-                search_paths.append(search_path)
+                    # SELECT with virtual loss
+                    while node.expanded() and not self.game.is_terminal(current_state):
+                        action, node = self._select_child(node)
+                        # Apply virtual loss
+                        node.visit_count += 1
+                        node.value_sum -= self.virtual_loss
+                        current_state = self.game.next_state(current_state, action)
+                        search_path.append(node)
 
-                if self.game.is_terminal(current_state):
-                    # Terminal state
-                    terminal_values.append(self.game.terminal_reward(current_state))
-                    terminal_indices.append(i)
-                elif not node.expanded():
-                    # Need to expand this node
-                    nodes.append(node)
-                    leaf_states.append(current_state)
-                    leaf_indices.append(i)
+                    path_idx = len(all_search_paths)
+                    all_search_paths.append((state_idx, search_path))
 
-            # Batch expand non-terminal leaves
-            if leaf_states:
-                leaf_states_arr = np.stack(leaf_states)
-                values = self._batch_expand_leaves(nodes, leaf_states_arr, model, device)
+                    if self.game.is_terminal(current_state):
+                        all_terminal_info.append((state_idx, path_idx, self.game.terminal_reward(current_state)))
+                    elif not node.expanded():
+                        all_leaf_states.append(current_state)
+                        all_leaf_info.append((state_idx, path_idx))
 
-                # Backup non-terminal leaves
-                for idx, value in zip(leaf_indices, values):
-                    self._backup(search_paths[idx], value)
+            # Batch expand all non-terminal leaves at once
+            if all_leaf_states:
+                leaf_states_arr = np.stack(all_leaf_states)
+                leaf_nodes = [all_search_paths[info[1]][1][-1] for info in all_leaf_info]
+                values = self._batch_expand_leaves(leaf_nodes, leaf_states_arr, model, device)
 
-            # Backup terminal leaves
-            for idx, value in zip(terminal_indices, terminal_values):
-                self._backup(search_paths[idx], value)
+                # Backup and remove virtual loss
+                for (state_idx, path_idx), value in zip(all_leaf_info, values):
+                    search_path = all_search_paths[path_idx][1]
+                    self._backup_with_virtual_loss_removal(search_path, value)
+
+            # Backup terminal states and remove virtual loss
+            for state_idx, path_idx, value in all_terminal_info:
+                search_path = all_search_paths[path_idx][1]
+                self._backup_with_virtual_loss_removal(search_path, value)
+
+            # Handle paths that hit already-expanded nodes (no leaf to expand)
+            expanded_paths = set(range(len(all_search_paths)))
+            expanded_paths -= {info[1] for info in all_leaf_info}
+            expanded_paths -= {info[1] for info in all_terminal_info}
+            for path_idx in expanded_paths:
+                search_path = all_search_paths[path_idx][1]
+                # Just remove virtual loss, backup with 0 (already expanded)
+                self._remove_virtual_loss(search_path)
+
+            sims_done += sims_this_batch
 
         # Collect policies
-        policies = np.zeros((batch_size, self.game.config.action_size), dtype=np.float32)
+        policies = np.zeros((num_states, self.game.config.action_size), dtype=np.float32)
         for i, root in enumerate(roots):
             policies[i] = self._get_policy(root)
 
         return policies
+
+    def _backup_with_virtual_loss_removal(self, search_path: List[Node], value: float) -> None:
+        """Backup value and remove virtual loss from path."""
+        for node in reversed(search_path):
+            # Remove virtual loss (except for root which didn't get it)
+            if node != search_path[0]:
+                node.visit_count -= 1
+                node.value_sum += self.virtual_loss
+            # Apply real backup
+            node.visit_count += 1
+            node.value_sum += value
+            value = -value
+
+    def _remove_virtual_loss(self, search_path: List[Node]) -> None:
+        """Remove virtual loss from path without backup."""
+        for node in search_path[1:]:  # Skip root
+            node.visit_count -= 1
+            node.value_sum += self.virtual_loss
 
     def _batch_expand(
         self,
