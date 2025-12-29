@@ -19,88 +19,99 @@ from nanozero.config import get_game_config, get_model_config, MCTSConfig, Train
 from nanozero.common import get_device, set_seed, print0, save_checkpoint, load_checkpoint, AverageMeter
 
 
-def self_play_game(game, model, mcts, temperature_threshold=15):
+def self_play_games(game, model, mcts, num_games, temperature_threshold=15, parallel_games=8):
     """
-    Play a single game of self-play.
+    Play multiple games of self-play in parallel for GPU efficiency.
+
+    Runs multiple games simultaneously, batching MCTS neural network calls
+    across all active games for much better GPU utilization.
 
     Args:
         game: Game instance
         model: Neural network
         mcts: MCTS instance
+        num_games: Total number of games to play
         temperature_threshold: Move number after which temperature becomes 0
-
-    Returns:
-        List of (canonical_state, policy, current_player) tuples
-    """
-    state = game.initial_state()
-    examples = []
-    move_count = 0
-
-    while not game.is_terminal(state):
-        player = game.current_player(state)
-
-        # Run MCTS on the real state; canonicalize only for storage
-        temperature = 1.0 if move_count < temperature_threshold else 0.0
-        policy = mcts.search(
-            state[np.newaxis, ...],
-            model,
-            add_noise=(move_count == 0)  # Add noise only at root
-        )[0]
-
-        # Store example (without value yet - we'll add it at the end)
-        canonical = game.canonical_state(state)
-        examples.append((canonical.copy(), policy.copy(), player))
-
-        # Sample action
-        action = sample_action(policy, temperature=temperature)
-        state = game.next_state(state, action)
-        move_count += 1
-
-    # Get terminal reward from perspective of final state
-    reward = game.terminal_reward(state)
-    final_player = game.current_player(state)
-
-    # Assign values to all examples
-    training_examples = []
-    for canonical, policy, player in examples:
-        # Value from this player's perspective (reward is from final player's view)
-        if player == final_player:
-            value = reward
-        else:
-            value = -reward
-        training_examples.append((canonical, policy, value))
-
-    return training_examples
-
-
-def self_play_games(game, model, mcts, num_games, temperature_threshold=15):
-    """
-    Play multiple games of self-play.
-
-    Args:
-        game: Game instance
-        model: Neural network
-        mcts: MCTS instance
-        num_games: Number of games to play
-        temperature_threshold: Move number after which temperature becomes 0
+        parallel_games: Number of games to run in parallel
 
     Returns:
         List of all (canonical_state, policy, value) tuples from all games
     """
     model.eval()
     all_examples = []
+    games_completed = 0
 
-    for i in range(num_games):
-        examples = self_play_game(game, model, mcts, temperature_threshold)
+    # Initialize parallel game states
+    n_parallel = min(parallel_games, num_games)
+    states = [game.initial_state() for _ in range(n_parallel)]
+    move_counts = [0] * n_parallel
+    game_examples = [[] for _ in range(n_parallel)]  # (canonical, policy, player) per game
 
-        # Add symmetries for data augmentation
-        for state, policy, value in examples:
-            symmetries = game.symmetries(state, policy)
-            for sym_state, sym_policy in symmetries:
-                all_examples.append((sym_state, sym_policy, value))
+    while games_completed < num_games:
+        # Find active (non-terminal) games
+        active_indices = [i for i, s in enumerate(states) if not game.is_terminal(s)]
 
-        if (i + 1) % 10 == 0:
-            print0(f"  Self-play: {i+1}/{num_games} games")
+        if not active_indices:
+            # All current games finished, shouldn't happen but handle it
+            break
+
+        # Batch all active states for MCTS
+        active_states = np.stack([states[i] for i in active_indices])
+        add_noise = [move_counts[i] == 0 for i in active_indices]
+
+        # Single batched MCTS call for all active games
+        policies = mcts.search(
+            active_states,
+            model,
+            add_noise=any(add_noise)  # Add noise if any game is at move 0
+        )
+
+        # Process each active game
+        for idx, game_idx in enumerate(active_indices):
+            state = states[game_idx]
+            policy = policies[idx]
+            player = game.current_player(state)
+            move_count = move_counts[game_idx]
+
+            # Store example
+            canonical = game.canonical_state(state)
+            game_examples[game_idx].append((canonical.copy(), policy.copy(), player))
+
+            # Sample action with temperature
+            temperature = 1.0 if move_count < temperature_threshold else 0.0
+            action = sample_action(policy, temperature=temperature)
+
+            # Apply action
+            states[game_idx] = game.next_state(state, action)
+            move_counts[game_idx] += 1
+
+        # Check for finished games and collect examples
+        for i in range(n_parallel):
+            if game.is_terminal(states[i]) and game_examples[i]:
+                # Game finished - assign values and collect examples
+                reward = game.terminal_reward(states[i])
+                final_player = game.current_player(states[i])
+
+                for canonical, policy, player in game_examples[i]:
+                    if player == final_player:
+                        value = reward
+                    else:
+                        value = -reward
+
+                    # Add symmetries for data augmentation
+                    for sym_state, sym_policy in game.symmetries(canonical, policy):
+                        all_examples.append((sym_state, sym_policy, value))
+
+                games_completed += 1
+
+                # Start a new game if we need more
+                if games_completed < num_games:
+                    states[i] = game.initial_state()
+                    move_counts[i] = 0
+                    game_examples[i] = []
+
+                if games_completed % 10 == 0:
+                    print0(f"  Self-play: {games_completed}/{num_games} games")
 
     return all_examples
 
@@ -241,6 +252,8 @@ def main():
                         help='MCTS simulations per move')
     parser.add_argument('--temperature_threshold', type=int, default=15,
                         help='Move number after which temperature is 0')
+    parser.add_argument('--parallel_games', type=int, default=8,
+                        help='Number of games to run in parallel during self-play')
 
     # Checkpointing and evaluation
     parser.add_argument('--checkpoint_interval', type=int, default=10,
@@ -301,7 +314,7 @@ def main():
         print0(f"Resumed from iteration {start_iteration}")
 
     print0(f"\nStarting training for {args.num_iterations} iterations")
-    print0(f"  {args.games_per_iteration} games/iteration")
+    print0(f"  {args.games_per_iteration} games/iteration ({args.parallel_games} parallel)")
     print0(f"  {args.training_steps} training steps/iteration")
     print0(f"  {args.mcts_simulations} MCTS simulations/move")
     print0("")
@@ -317,7 +330,8 @@ def main():
         examples = self_play_games(
             game, model, mcts,
             num_games=args.games_per_iteration,
-            temperature_threshold=args.temperature_threshold
+            temperature_threshold=args.temperature_threshold,
+            parallel_games=args.parallel_games
         )
 
         # Add to buffer
