@@ -116,18 +116,20 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
     return all_examples
 
 
-def train_step(model, optimizer, states, policies, values, action_masks, device):
+def train_step(model, optimizer, scaler, states, policies, values, action_masks, device, use_amp):
     """
-    Perform a single training step.
+    Perform a single training step with optional mixed precision.
 
     Args:
         model: Neural network
         optimizer: Optimizer
+        scaler: GradScaler for mixed precision (can be disabled)
         states: Batch of state tensors (B, board_size)
         policies: Batch of policy targets (B, action_size)
         values: Batch of value targets (B,)
         action_masks: Batch of legal action masks (B, action_size)
         device: Torch device
+        use_amp: Whether to use automatic mixed precision
 
     Returns:
         Tuple of (total_loss, policy_loss, value_loss)
@@ -139,22 +141,25 @@ def train_step(model, optimizer, states, policies, values, action_masks, device)
     values = values.to(device)
     action_masks = action_masks.to(device)
 
-    # Forward pass
-    pred_log_policies, pred_values = model(states, action_masks)
-
-    # Policy loss: cross-entropy (using log-softmax output)
-    policy_loss = -torch.mean(torch.sum(policies * pred_log_policies, dim=1))
-
-    # Value loss: MSE
-    value_loss = F.mse_loss(pred_values.squeeze(-1), values)
-
-    # Total loss
-    loss = policy_loss + value_loss
-
-    # Backward pass
     optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+
+    # Forward pass with optional mixed precision
+    with torch.amp.autocast('cuda', enabled=use_amp):
+        pred_log_policies, pred_values = model(states, action_masks)
+
+        # Policy loss: cross-entropy (using log-softmax output)
+        policy_loss = -torch.mean(torch.sum(policies * pred_log_policies, dim=1))
+
+        # Value loss: MSE
+        value_loss = F.mse_loss(pred_values.squeeze(-1), values)
+
+        # Total loss
+        loss = policy_loss + value_loss
+
+    # Backward pass with gradient scaling
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
 
     return loss.item(), policy_loss.item(), value_loss.item()
 
@@ -225,7 +230,7 @@ def main():
 
     # Game settings
     parser.add_argument('--game', type=str, default='tictactoe',
-                        help='Game to train on (tictactoe, connect4)')
+                        help='Game to train on (tictactoe, connect4, go9x9, go19x19)')
 
     # Model settings
     parser.add_argument('--n_layer', type=int, default=4,
@@ -297,6 +302,12 @@ def main():
         weight_decay=args.weight_decay
     )
 
+    # Mixed precision setup (only for CUDA)
+    use_amp = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    if use_amp:
+        print0("Using mixed precision training (FP16)")
+
     # Create MCTS
     mcts_config = MCTSConfig(num_simulations=args.mcts_simulations)
     mcts = BatchedMCTS(game, mcts_config)
@@ -310,7 +321,7 @@ def main():
     # Resume from checkpoint if specified
     start_iteration = 0
     if args.resume:
-        start_iteration = load_checkpoint(args.resume, model, optimizer)
+        start_iteration = load_checkpoint(args.resume, model, optimizer, scaler=scaler)
         print0(f"Resumed from iteration {start_iteration}")
 
     print0(f"\nStarting training for {args.num_iterations} iterations")
@@ -364,9 +375,9 @@ def main():
 
                 # Train step
                 loss, policy_loss, value_loss = train_step(
-                    model, optimizer,
+                    model, optimizer, scaler,
                     state_tensors, policy_tensors, value_tensors,
-                    action_mask_tensors, device
+                    action_mask_tensors, device, use_amp
                 )
 
                 loss_meter.update(loss)
@@ -374,6 +385,9 @@ def main():
                 value_loss_meter.update(value_loss)
 
             print0(f"  Loss: {loss_meter.avg:.4f} (policy: {policy_loss_meter.avg:.4f}, value: {value_loss_meter.avg:.4f})")
+
+            # Clear MCTS cache after training (model weights changed)
+            mcts.clear_cache()
 
         # Evaluation
         if (iteration + 1) % args.eval_interval == 0:
@@ -387,7 +401,7 @@ def main():
                 args.checkpoint_dir,
                 f"{args.game}_iter{iteration + 1}.pt"
             )
-            save_checkpoint(model, optimizer, iteration + 1, ckpt_path)
+            save_checkpoint(model, optimizer, iteration + 1, ckpt_path, scaler=scaler)
             print0(f"  Saved checkpoint: {ckpt_path}")
 
         iter_time = time.time() - iter_start
@@ -396,7 +410,7 @@ def main():
 
     # Save final checkpoint
     final_path = os.path.join(args.checkpoint_dir, f"{args.game}_final.pt")
-    save_checkpoint(model, optimizer, args.num_iterations, final_path)
+    save_checkpoint(model, optimizer, args.num_iterations, final_path, scaler=scaler)
     print0(f"Saved final checkpoint: {final_path}")
 
     # Final evaluation

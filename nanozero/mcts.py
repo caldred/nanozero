@@ -11,6 +11,146 @@ from nanozero.config import MCTSConfig
 from nanozero.game import Game
 
 
+class TranspositionTable:
+    """
+    Cache for neural network evaluations with symmetry awareness.
+
+    Stores (policy, value) pairs keyed by canonical board state.
+    When looking up, checks all symmetric variants and transforms
+    the cached policy back to the original orientation.
+    """
+
+    def __init__(self, game: Game):
+        """
+        Initialize transposition table.
+
+        Args:
+            game: Game instance (used for symmetry operations)
+        """
+        self.game = game
+        self.cache: Dict[bytes, Tuple[np.ndarray, float]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def _get_board(self, state: np.ndarray) -> np.ndarray:
+        """Extract board portion from state (handles Go's metadata row)."""
+        if hasattr(self.game, 'height') and state.shape[0] > self.game.height:
+            return state[:self.game.height, :]
+        return state
+
+    def _canonical_key(self, state: np.ndarray) -> Tuple[bytes, int]:
+        """
+        Find canonical (smallest) symmetric form and which symmetry index it is.
+
+        Returns:
+            Tuple of (canonical_key, symmetry_index)
+        """
+        board = self._get_board(state)
+        canonical = board.tobytes()
+        canonical_idx = 0
+
+        # Generate all symmetries and find the smallest
+        dummy_policy = np.zeros(self.game.config.action_size)
+        symmetries = self.game.symmetries(state, dummy_policy)
+
+        for i, (sym_state, _) in enumerate(symmetries):
+            sym_board = self._get_board(sym_state)
+            sym_key = sym_board.tobytes()
+            if sym_key < canonical:
+                canonical = sym_key
+                canonical_idx = i
+
+        return canonical, canonical_idx
+
+    def _transform_policy_to_original(
+        self,
+        cached_policy: np.ndarray,
+        sym_idx: int,
+        original_state: np.ndarray
+    ) -> np.ndarray:
+        """
+        Transform cached policy from canonical form back to original orientation.
+
+        The approach: generate symmetries from the canonical state with the cached
+        policy, then find which symmetric state matches our original and return
+        that policy.
+        """
+        if sym_idx == 0:
+            return cached_policy
+
+        # Get the canonical state
+        dummy_policy = np.zeros(self.game.config.action_size)
+        original_symmetries = self.game.symmetries(original_state, dummy_policy)
+        canonical_state = original_symmetries[sym_idx][0]
+
+        # Generate all symmetries from canonical state with the cached policy
+        canonical_symmetries = self.game.symmetries(canonical_state, cached_policy)
+
+        # Find which one matches our original state
+        orig_board = self._get_board(original_state)
+        orig_key = orig_board.tobytes()
+
+        for sym_state, sym_policy in canonical_symmetries:
+            sym_board = self._get_board(sym_state)
+            if sym_board.tobytes() == orig_key:
+                return sym_policy
+
+        # Fallback (shouldn't happen if symmetries are implemented correctly)
+        return cached_policy
+
+    def get(self, state: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
+        """
+        Look up cached evaluation, checking symmetries.
+
+        Args:
+            state: Game state to look up
+
+        Returns:
+            Tuple of (policy, value) if found, None otherwise
+        """
+        canonical_key, sym_idx = self._canonical_key(state)
+
+        if canonical_key in self.cache:
+            self.hits += 1
+            cached_policy, cached_value = self.cache[canonical_key]
+            # Transform policy back to original orientation
+            policy = self._transform_policy_to_original(cached_policy, sym_idx, state)
+            return policy, cached_value
+
+        self.misses += 1
+        return None
+
+    def put(self, state: np.ndarray, policy: np.ndarray, value: float):
+        """
+        Store evaluation in canonical form.
+
+        Args:
+            state: Game state
+            policy: Policy from neural network
+            value: Value from neural network
+        """
+        canonical_key, sym_idx = self._canonical_key(state)
+
+        # Transform policy to canonical orientation before storing
+        if sym_idx != 0:
+            symmetries = self.game.symmetries(state, policy)
+            canonical_policy = symmetries[sym_idx][1]
+        else:
+            canonical_policy = policy
+
+        self.cache[canonical_key] = (canonical_policy.copy(), value)
+
+    def clear(self):
+        """Clear cache (call between searches during training)."""
+        self.cache.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def stats(self) -> Tuple[int, int, int]:
+        """Return (hits, misses, cache_size)."""
+        return self.hits, self.misses, len(self.cache)
+
+
 class Node:
     """
     MCTS tree node.
@@ -267,7 +407,8 @@ class BatchedMCTS:
     parallel simulations within each search.
     """
 
-    def __init__(self, game: Game, config: MCTSConfig, virtual_loss: float = 1.0):
+    def __init__(self, game: Game, config: MCTSConfig, virtual_loss: float = 1.0,
+                 use_transposition_table: bool = False):
         """
         Initialize batched MCTS.
 
@@ -275,10 +416,18 @@ class BatchedMCTS:
             game: Game instance
             config: MCTS configuration
             virtual_loss: Virtual loss value to apply during parallel selection
+            use_transposition_table: Whether to cache NN evaluations with symmetry awareness
         """
         self.game = game
         self.config = config
         self.virtual_loss = virtual_loss
+        self.use_tt = use_transposition_table
+        self.tt = TranspositionTable(game) if use_transposition_table else None
+
+    def clear_cache(self):
+        """Clear the transposition table. Call this after model weights change."""
+        if self.tt:
+            self.tt.clear()
 
     def search(
         self,
@@ -295,7 +444,7 @@ class BatchedMCTS:
         search, batching their neural network calls together.
 
         Args:
-            states: Batch of game states, shape (B, H, W), raw board values
+            states: Batch of game states (shape is game-defined)
             model: Neural network for policy/value prediction
             num_simulations: Number of MCTS simulations per state
             add_noise: Whether to add Dirichlet noise at roots
@@ -422,7 +571,7 @@ class BatchedMCTS:
 
         Args:
             nodes: List of nodes to expand
-            states: Batch of states, shape (B, H, W)
+            states: Batch of states (shape is game-defined)
             model: Neural network
             device: Device for inference
 
@@ -462,11 +611,11 @@ class BatchedMCTS:
         device: torch.device
     ) -> List[float]:
         """
-        Expand leaf nodes in a batch.
+        Expand leaf nodes in a batch, using transposition table if enabled.
 
         Args:
             nodes: List of leaf nodes to expand
-            states: Batch of states at these leaves, shape (B, H, W)
+            states: Batch of leaf states (shape is game-defined)
             model: Neural network
             device: Device for inference
 
@@ -474,8 +623,93 @@ class BatchedMCTS:
             List of values for each leaf
         """
         batch_size = len(nodes)
+        results = [None] * batch_size
 
-        # Prepare batch tensors (canonical perspective for each state)
+        if not self.tt:
+            # No cache - just evaluate all
+            return self._batch_expand_leaves_no_cache(nodes, states, model, device)
+
+        # Check transposition table for cache hits
+        miss_indices = []
+        miss_canonical_keys = []
+
+        for i in range(batch_size):
+            state = states[i]
+            node = nodes[i]
+
+            # Check cache
+            cached = self.tt.get(state)
+            if cached is not None:
+                policy, value = cached
+                # Create children from cached policy
+                legal_actions = self.game.legal_actions(state)
+                for action in legal_actions:
+                    node.children[action] = Node(prior=policy[action])
+                results[i] = value
+            else:
+                # Cache miss - record canonical key for deduplication
+                canonical_key, _ = self.tt._canonical_key(state)
+                miss_indices.append(i)
+                miss_canonical_keys.append(canonical_key)
+
+        # Deduplicate misses by canonical key - only evaluate unique positions
+        if miss_indices:
+            # Group misses by canonical key
+            unique_keys = {}  # canonical_key -> first index in miss_indices
+            for j, (idx, key) in enumerate(zip(miss_indices, miss_canonical_keys)):
+                if key not in unique_keys:
+                    unique_keys[key] = j
+
+            # Only evaluate unique positions
+            unique_indices = list(unique_keys.values())
+            unique_states = [states[miss_indices[j]] for j in unique_indices]
+
+            # Prepare batch tensors
+            state_tensors = torch.stack([
+                self.game.to_tensor(self.game.canonical_state(s)) for s in unique_states
+            ]).to(device)
+
+            action_masks = torch.stack([
+                torch.from_numpy(self.game.legal_actions_mask(s))
+                for s in unique_states
+            ]).float().to(device)
+
+            # Get predictions for unique positions only
+            policies, values = model.predict(state_tensors, action_masks)
+            policies = policies.cpu().numpy()
+            values = values.cpu().numpy().flatten()
+
+            # Store unique results in cache
+            for j, state in enumerate(unique_states):
+                self.tt.put(state, policies[j], values[j])
+
+            # Now expand all miss nodes using cached results
+            for idx in miss_indices:
+                state = states[idx]
+                node = nodes[idx]
+
+                # Get from cache (guaranteed hit now)
+                policy, value = self.tt.get(state)
+
+                # Create children
+                legal_actions = self.game.legal_actions(state)
+                for action in legal_actions:
+                    node.children[action] = Node(prior=policy[action])
+
+                results[idx] = value
+
+        return results
+
+    def _batch_expand_leaves_no_cache(
+        self,
+        nodes: List[Node],
+        states: np.ndarray,
+        model: torch.nn.Module,
+        device: torch.device
+    ) -> List[float]:
+        """Expand leaves without using cache."""
+        batch_size = len(nodes)
+
         state_tensors = torch.stack([
             self.game.to_tensor(self.game.canonical_state(states[i])) for i in range(batch_size)
         ]).to(device)
@@ -485,12 +719,10 @@ class BatchedMCTS:
             for i in range(batch_size)
         ]).float().to(device)
 
-        # Get predictions
         policies, values = model.predict(state_tensors, action_masks)
         policies = policies.cpu().numpy()
         values = values.cpu().numpy().flatten()
 
-        # Create children for each node
         for i, node in enumerate(nodes):
             legal_actions = self.game.legal_actions(states[i])
             for action in legal_actions:
