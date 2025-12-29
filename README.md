@@ -4,7 +4,7 @@
 
 Inspired by Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat), NanoZero is a small, readable, hackable implementation of the [AlphaZero](https://www.nature.com/articles/nature24270) algorithm. The goal is to keep the core loop obvious and the code easy to bend.
 
-## features
+## Features
 
 - Transformer policy-value network (generalizes across games)
 - Batched MCTS for efficient GPU utilization
@@ -12,7 +12,7 @@ Inspired by Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanoc
 - Minimal dependencies: PyTorch + NumPy only
 - Single slider of complexity: just change `--n_layer` to scale
 
-## quick start
+## Quick Start
 
 ```bash
 # Clone and setup
@@ -30,7 +30,7 @@ python -m scripts.train --game=tictactoe --n_layer=2 --num_iterations=50
 python -m scripts.play --game=tictactoe --checkpoint=checkpoints/tictactoe_final.pt --n_layer=2
 ```
 
-## training recipes
+## Training Recipes
 
 | Game | Command | Time | Win Rate |
 |------|---------|------|----------|
@@ -47,7 +47,7 @@ python -m scripts.train \
     --mcts_simulations=100
 ```
 
-## how it works
+## How It Works
 
 NanoZero implements the AlphaZero algorithm:
 
@@ -56,7 +56,7 @@ NanoZero implements the AlphaZero algorithm:
 3. **Train**: Update network to predict MCTS policy and game outcome
 4. **Repeat**: The network improves, making MCTS stronger, generating better data
 
-### architecture
+### Architecture
 
 ```
 Board State → Transformer → Policy (where to play) + Value (who's winning)
@@ -69,7 +69,7 @@ The Transformer sees the board as a sequence of tokens:
 
 MCTS uses the network to guide search, then returns an improved policy.
 
-## file structure
+## File Structure
 
 ```
 nanozero/
@@ -90,7 +90,7 @@ nanozero/
 └── pyproject.toml
 ```
 
-## configuration
+## Configuration
 
 All training is controlled via command-line arguments:
 
@@ -105,7 +105,7 @@ python -m scripts.train \
     --lr=1e-3                   # Learning rate
 ```
 
-## extending to new games
+## Extending to New Games
 
 Implement the `Game` interface:
 
@@ -139,13 +139,13 @@ class MyGame(Game):
         # Data augmentation via board symmetries
 ```
 
-## references
+## References
 
 - [Mastering the game of Go without human knowledge](https://www.nature.com/articles/nature24270) (AlphaGo Zero)
 - [Mastering Chess and Shogi by Self-Play](https://arxiv.org/abs/1712.01815) (AlphaZero)
 - [nanoGPT](https://github.com/karpathy/nanoGPT) / [nanochat](https://github.com/karpathy/nanochat)
 - [alpha-zero-general](https://github.com/suragnair/alpha-zero-general)
 
-## license
+## License
 
 MIT
