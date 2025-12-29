@@ -72,6 +72,18 @@ def get_game_config(name: str) -> GameConfig:
             board_width=7,
             action_size=7,
         ),
+        'go9x9': GameConfig(
+            name='go9x9',
+            board_height=9,
+            board_width=9,
+            action_size=82,  # 81 board positions + pass
+        ),
+        'go19x19': GameConfig(
+            name='go19x19',
+            board_height=19,
+            board_width=19,
+            action_size=362,  # 361 board positions + pass
+        ),
     }
     if name not in configs:
         raise ValueError(f"Unknown game: {name}")
