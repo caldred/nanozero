@@ -2,17 +2,17 @@
 
 > A minimal AlphaZero implementation in ~1200 lines of Python.
 
-Inspired by Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat), NanoZero is a clean, readable, hackable implementation of the [AlphaZero](https://www.nature.com/articles/nature24270) algorithm.
+Inspired by Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) and [nanochat](https://github.com/karpathy/nanochat), NanoZero is a small, readable, hackable implementation of the [AlphaZero](https://www.nature.com/articles/nature24270) algorithm. The goal is to keep the core loop obvious and the code easy to bend.
 
-## Features
+## features
 
-- 🧠 **Transformer-based** policy-value network (generalizes across games)
-- 🌳 **Batched MCTS** for efficient GPU utilization
-- 🎮 **Multiple games**: TicTacToe, Connect4 (extensible to more)
-- 📦 **Minimal dependencies**: PyTorch + NumPy only
-- 🚀 **Single slider of complexity**: Just change `--n_layer` to scale
+- Transformer policy-value network (generalizes across games)
+- Batched MCTS for efficient GPU utilization
+- Multiple games: TicTacToe, Connect4, Go (9x9, 19x19)
+- Minimal dependencies: PyTorch + NumPy only
+- Single slider of complexity: just change `--n_layer` to scale
 
-## Quick Start
+## quick start
 
 ```bash
 # Clone and setup
@@ -30,7 +30,7 @@ python -m scripts.train --game=tictactoe --n_layer=2 --num_iterations=50
 python -m scripts.play --game=tictactoe --checkpoint=checkpoints/tictactoe_final.pt --n_layer=2
 ```
 
-## Training Recipes
+## training recipes
 
 | Game | Command | Time | Win Rate |
 |------|---------|------|----------|
@@ -47,7 +47,7 @@ python -m scripts.train \
     --mcts_simulations=100
 ```
 
-## How It Works
+## how it works
 
 NanoZero implements the AlphaZero algorithm:
 
@@ -56,7 +56,7 @@ NanoZero implements the AlphaZero algorithm:
 3. **Train**: Update network to predict MCTS policy and game outcome
 4. **Repeat**: The network improves, making MCTS stronger, generating better data
 
-### Architecture
+### architecture
 
 ```
 Board State → Transformer → Policy (where to play) + Value (who's winning)
@@ -69,14 +69,14 @@ The Transformer sees the board as a sequence of tokens:
 
 MCTS uses the network to guide search, then returns an improved policy.
 
-## File Structure
+## file structure
 
 ```
 nanozero/
 ├── nanozero/
 │   ├── common.py         # Utilities
 │   ├── config.py         # Configuration dataclasses
-│   ├── game.py           # Game interface + TicTacToe, Connect4
+│   ├── game.py           # Game interface + TicTacToe, Connect4, Go
 │   ├── model.py          # Transformer policy-value network
 │   ├── mcts.py           # Monte Carlo Tree Search
 │   └── replay.py         # Replay buffer
@@ -90,7 +90,7 @@ nanozero/
 └── pyproject.toml
 ```
 
-## Configuration
+## configuration
 
 All training is controlled via command-line arguments:
 
@@ -105,7 +105,7 @@ python -m scripts.train \
     --lr=1e-3                   # Learning rate
 ```
 
-## Extending to New Games
+## extending to new games
 
 Implement the `Game` interface:
 
@@ -119,6 +119,9 @@ class MyGame(Game):
     
     def initial_state(self) -> np.ndarray:
         # Return starting board
+
+    def current_player(self, state) -> int:
+        # Return 1 if player 1's turn, -1 if player 2's turn
     
     def legal_actions(self, state) -> List[int]:
         # Return list of valid moves
@@ -130,20 +133,19 @@ class MyGame(Game):
         # Is game over?
     
     def terminal_reward(self, state) -> float:
-        # Who won? (-1, 0, or 1)
+        # Terminal reward from current player's perspective (-1, 0, or 1)
     
     def symmetries(self, state, policy) -> List[Tuple]:
         # Data augmentation via board symmetries
 ```
 
-## References
+## references
 
 - [Mastering the game of Go without human knowledge](https://www.nature.com/articles/nature24270) (AlphaGo Zero)
 - [Mastering Chess and Shogi by Self-Play](https://arxiv.org/abs/1712.01815) (AlphaZero)
 - [nanoGPT](https://github.com/karpathy/nanoGPT) / [nanochat](https://github.com/karpathy/nanochat)
 - [alpha-zero-general](https://github.com/suragnair/alpha-zero-general)
 
-## License
+## license
 
 MIT
-
