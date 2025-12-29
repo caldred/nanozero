@@ -54,23 +54,30 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     iteration: int,
-    path: str
+    path: str,
+    scaler: Optional[object] = None
 ) -> None:
     """Save model checkpoint."""
-    torch.save({
+    checkpoint = {
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'iteration': iteration,
-    }, path)
+    }
+    if scaler is not None:
+        checkpoint['scaler'] = scaler.state_dict()
+    torch.save(checkpoint, path)
 
 def load_checkpoint(
     path: str,
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scaler: Optional[object] = None
 ) -> int:
     """Load model checkpoint. Returns iteration number."""
     ckpt = torch.load(path, map_location='cpu')
     model.load_state_dict(ckpt['model'])
     if optimizer is not None and 'optimizer' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer'])
+    if scaler is not None and 'scaler' in ckpt:
+        scaler.load_state_dict(ckpt['scaler'])
     return ckpt.get('iteration', 0)

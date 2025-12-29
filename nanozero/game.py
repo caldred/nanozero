@@ -216,10 +216,7 @@ class Go(Game):
     """
     Go game implementation with Chinese rules.
 
-    State shape: (board_height + 1, board_width)
-    - Rows 0 to height-1: actual board (1=black, -1=white, 0=empty)
-    - Row height (metadata): [consecutive_passes, ko_row, ko_col, move_count, ...]
-
+    State shape: (board_height + 1, board_width).
     Actions: 0 to height*width-1 are board positions, height*width is pass.
     """
 
