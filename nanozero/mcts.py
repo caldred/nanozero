@@ -435,7 +435,7 @@ class BatchedMCTS:
         model: torch.nn.Module,
         num_simulations: Optional[int] = None,
         add_noise: bool = True,
-        batch_size: int = 64
+        batch_size: int = 8
     ) -> np.ndarray:
         """
         Run batched MCTS on multiple states with virtual loss parallelism.
