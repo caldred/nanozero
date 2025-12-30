@@ -489,12 +489,15 @@ class BatchedMCTS:
                     search_path = [node]
                     current_state = state.copy()
 
+                    # Apply virtual loss to root for proper UCB exploration term
+                    root.visit_count += 1
+
                     # SELECT with virtual loss
                     while node.expanded() and not self.game.is_terminal(current_state):
                         action, node = self._select_child(node)
-                        # Apply virtual loss
+                        # Apply virtual loss (add to make value() positive, so -value() is negative)
                         node.visit_count += 1
-                        node.value_sum -= self.virtual_loss
+                        node.value_sum += self.virtual_loss
                         current_state = self.game.next_state(current_state, action)
                         search_path.append(node)
 
@@ -544,10 +547,10 @@ class BatchedMCTS:
     def _backup_with_virtual_loss_removal(self, search_path: List[Node], value: float) -> None:
         """Backup value and remove virtual loss from path."""
         for node in reversed(search_path):
-            # Remove virtual loss (except for root which didn't get it)
+            # Remove virtual loss from all nodes including root
+            node.visit_count -= 1
             if node != search_path[0]:
-                node.visit_count -= 1
-                node.value_sum += self.virtual_loss
+                node.value_sum -= self.virtual_loss
             # Apply real backup
             node.visit_count += 1
             node.value_sum += value
@@ -555,9 +558,12 @@ class BatchedMCTS:
 
     def _remove_virtual_loss(self, search_path: List[Node]) -> None:
         """Remove virtual loss from path without backup."""
-        for node in search_path[1:]:  # Skip root
+        # Remove root's visit count VL
+        search_path[0].visit_count -= 1
+        # Remove VL from other nodes
+        for node in search_path[1:]:
             node.visit_count -= 1
-            node.value_sum += self.virtual_loss
+            node.value_sum -= self.virtual_loss
 
     def _batch_expand(
         self,
