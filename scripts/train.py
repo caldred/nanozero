@@ -204,10 +204,9 @@ def evaluate_vs_random(game, model, mcts, num_games=50, mcts_simulations=25):
             current = game.current_player(state)
 
             if current == model_player:
-                # Model's turn
-                canonical = game.canonical_state(state)
+                # Model's turn - pass raw state, BatchedMCTS canonicalizes internally
                 policy = mcts.search(
-                    canonical[np.newaxis, ...],
+                    state[np.newaxis, ...],
                     model,
                     num_simulations=mcts_simulations,
                     add_noise=False
