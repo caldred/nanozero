@@ -435,13 +435,17 @@ class BatchedMCTS:
         model: torch.nn.Module,
         num_simulations: Optional[int] = None,
         add_noise: bool = True,
-        batch_size: int = 8
+        batch_size: Optional[int] = None
     ) -> np.ndarray:
         """
         Run batched MCTS on multiple states with virtual loss parallelism.
 
         Uses virtual loss to run multiple simulations in parallel within each
         search, batching their neural network calls together.
+
+        Note: batch_size controls parallelism within each search. If too large
+        relative to num_simulations, the tree won't grow deep enough. Default
+        is num_simulations // 8, capped at 256.
 
         Args:
             states: Batch of game states (shape is game-defined)
@@ -455,6 +459,9 @@ class BatchedMCTS:
         """
         if num_simulations is None:
             num_simulations = self.config.num_simulations
+
+        if batch_size is None:
+            batch_size = max(1, min(num_simulations // 8, 256))
 
         num_states = states.shape[0]
         device = next(model.parameters()).device
