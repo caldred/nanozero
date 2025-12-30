@@ -19,7 +19,8 @@ from nanozero.config import get_game_config, get_model_config, MCTSConfig, Train
 from nanozero.common import get_device, set_seed, print0, save_checkpoint, load_checkpoint, AverageMeter
 
 
-def self_play_games(game, model, mcts, num_games, temperature_threshold=15, parallel_games=8):
+@torch.inference_mode()
+def self_play_games(game, model, mcts, num_games, temperature_threshold=15, parallel_games=64):
     """
     Play multiple games of self-play in parallel for GPU efficiency.
 
@@ -164,6 +165,7 @@ def train_step(model, optimizer, scaler, states, policies, values, action_masks,
     return loss.item(), policy_loss.item(), value_loss.item()
 
 
+@torch.inference_mode()
 def evaluate_vs_random(game, model, mcts, num_games=50, mcts_simulations=25):
     """
     Evaluate model against random player.
@@ -257,7 +259,7 @@ def main():
                         help='MCTS simulations per move')
     parser.add_argument('--temperature_threshold', type=int, default=15,
                         help='Move number after which temperature is 0')
-    parser.add_argument('--parallel_games', type=int, default=8,
+    parser.add_argument('--parallel_games', type=int, default=64,
                         help='Number of games to run in parallel during self-play')
 
     # Checkpointing and evaluation

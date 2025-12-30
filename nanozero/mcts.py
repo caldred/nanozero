@@ -408,7 +408,7 @@ class BatchedMCTS:
     """
 
     def __init__(self, game: Game, config: MCTSConfig, virtual_loss: float = 1.0,
-                 use_transposition_table: bool = False):
+                 use_transposition_table: bool = True):
         """
         Initialize batched MCTS.
 
@@ -435,7 +435,7 @@ class BatchedMCTS:
         model: torch.nn.Module,
         num_simulations: Optional[int] = None,
         add_noise: bool = True,
-        batch_size: int = 8
+        batch_size: int = 64
     ) -> np.ndarray:
         """
         Run batched MCTS on multiple states with virtual loss parallelism.
