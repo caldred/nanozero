@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from nanozero.config import ModelConfig
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
 
@@ -94,7 +94,7 @@ class AlphaZeroTransformer(nn.Module):
         logits = self.policy_head(pooled)
         if action_mask is not None:
             mask = action_mask.bool()
-            logits = logits.masked_fill(~mask, -1e9)  # keep illegal moves far from softmax
+            logits = logits.masked_fill(~mask, 1e-4)  # keep illegal moves far from softmax
             # Fallback: if a row is fully masked (shouldn't happen), avoid NaNs by zeroing logits
             fully_masked = (~mask).all(dim=-1)
             if fully_masked.any():

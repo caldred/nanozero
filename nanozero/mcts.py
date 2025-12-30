@@ -802,7 +802,7 @@ def sample_action(probs: np.ndarray, temperature: float = 1.0) -> int:
     # Apply temperature
     if temperature != 1.0:
         # Use log to avoid numerical issues with power
-        log_probs = np.log(probs + 1e-10)
+        log_probs = np.log(probs + 1e-4)
         log_probs = log_probs / temperature
         probs = np.exp(log_probs - np.max(log_probs))  # Subtract max for numerical stability
         probs = probs / probs.sum()
