@@ -57,15 +57,25 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
             break
 
         # Batch all active states for MCTS
-        active_states = np.stack([states[i] for i in active_indices])
         add_noise = [move_counts[i] == 0 for i in active_indices]
 
-        # Single batched MCTS call for all active games
-        policies = mcts.search(
-            active_states,
-            model,
-            add_noise=any(add_noise)  # Add noise if any game is at move 0
-        )
+        # Apply Dirichlet noise only to roots at move 0 (avoid polluting all games)
+        policies = np.zeros((len(active_indices), game.config.action_size), dtype=np.float32)
+        active_pos = {game_idx: pos for pos, game_idx in enumerate(active_indices)}
+        noise_indices = [i for i in active_indices if move_counts[i] == 0]
+        no_noise_indices = [i for i in active_indices if move_counts[i] != 0]
+
+        if noise_indices:
+            noise_states = np.stack([states[i] for i in noise_indices])
+            noise_policies = mcts.search(noise_states, model, add_noise=True)
+            for local_idx, game_idx in enumerate(noise_indices):
+                policies[active_pos[game_idx]] = noise_policies[local_idx]
+
+        if no_noise_indices:
+            no_noise_states = np.stack([states[i] for i in no_noise_indices])
+            no_noise_policies = mcts.search(no_noise_states, model, add_noise=False)
+            for local_idx, game_idx in enumerate(no_noise_indices):
+                policies[active_pos[game_idx]] = no_noise_policies[local_idx]
 
         # Process each active game
         for idx, game_idx in enumerate(active_indices):
