@@ -261,6 +261,8 @@ def main():
                         help='Move number after which temperature is 0')
     parser.add_argument('--parallel_games', type=int, default=64,
                         help='Number of games to run in parallel during self-play')
+    parser.add_argument('--no_transposition_table', action='store_true',
+                        help='Disable symmetry-aware transposition table in MCTS')
 
     # Checkpointing and evaluation
     parser.add_argument('--checkpoint_interval', type=int, default=10,
@@ -312,7 +314,10 @@ def main():
 
     # Create MCTS
     mcts_config = MCTSConfig(num_simulations=args.mcts_simulations)
-    mcts = BatchedMCTS(game, mcts_config)
+    use_tt = not args.no_transposition_table
+    mcts = BatchedMCTS(game, mcts_config, use_transposition_table=use_tt)
+    if not use_tt:
+        print0("Transposition table disabled")
 
     # Create replay buffer
     buffer = ReplayBuffer(args.buffer_size)
