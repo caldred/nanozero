@@ -43,6 +43,32 @@ class MCTSConfig:
     temperature: float = 1.0
 
 @dataclass
+class BayesianMCTSConfig:
+    """Configuration for Bayesian BAI-MCTS.
+
+    Uses Gaussian beliefs with Thompson sampling instead of PUCT.
+    Optimizes for best arm identification rather than cumulative regret.
+    Note: No Dirichlet noise - Thompson sampling provides exploration naturally.
+    Note: No temperature - policy is probability of optimality via Thompson sampling.
+    """
+    num_simulations: int = 100
+
+    # Bayesian prior hyperparameters
+    sigma_0: float = 1.0          # Prior std for logit-shifted initialization
+    obs_var: float = 0.5          # Observation variance (fixed; future: model-predicted)
+
+    # IDS hyperparameters
+    ids_alpha: float = 0.5        # Pseudocount for IDS allocation
+
+    # Early stopping
+    early_stopping: bool = True   # Whether to stop when confident about best action
+    confidence_threshold: float = 0.95  # P(leader is optimal) threshold for stopping
+    min_simulations: int = 10     # Minimum simulations before early stopping
+
+    # Numerical stability
+    min_variance: float = 1e-6    # Floor for variance to avoid division by zero
+
+@dataclass
 class TrainConfig:
     """Configuration for training loop."""
     num_iterations: int = 100

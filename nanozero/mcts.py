@@ -38,29 +38,45 @@ class TranspositionTable:
             return state[:self.game.height, :]
         return state
 
+    def _get_metadata(self, state: np.ndarray) -> Optional[bytes]:
+        """Extract metadata portion from state (Go's turn/ko/passes row)."""
+        if hasattr(self.game, 'height') and state.shape[0] > self.game.height:
+            return state[self.game.height:, :].tobytes()
+        return None
+
     def _canonical_key(self, state: np.ndarray) -> Tuple[bytes, int]:
         """
         Find canonical (smallest) symmetric form and which symmetry index it is.
+
+        For games with metadata (like Go), the key includes both the canonical
+        board AND the metadata, so different turns/ko/passes don't collide.
 
         Returns:
             Tuple of (canonical_key, symmetry_index)
         """
         board = self._get_board(state)
-        canonical = board.tobytes()
+        canonical_board = board.tobytes()
         canonical_idx = 0
 
-        # Generate all symmetries and find the smallest
+        # Generate all symmetries and find the smallest (by board only)
         dummy_policy = np.zeros(self.game.config.action_size)
         symmetries = self.game.symmetries(state, dummy_policy)
 
         for i, (sym_state, _) in enumerate(symmetries):
             sym_board = self._get_board(sym_state)
             sym_key = sym_board.tobytes()
-            if sym_key < canonical:
-                canonical = sym_key
+            if sym_key < canonical_board:
+                canonical_board = sym_key
                 canonical_idx = i
 
-        return canonical, canonical_idx
+        # Include metadata in the key (if present) to avoid collisions
+        metadata = self._get_metadata(state)
+        if metadata is not None:
+            canonical_key = canonical_board + metadata
+        else:
+            canonical_key = canonical_board
+
+        return canonical_key, canonical_idx
 
     def _transform_policy_to_original(
         self,
