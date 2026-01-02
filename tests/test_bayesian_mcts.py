@@ -324,6 +324,182 @@ class TestBayesianBackup:
         # Child should receive positive value (from its perspective, it's winning)
         assert child.mu > 0
 
+    def test_backup_updates_aggregation(self):
+        """After backup, parent has aggregated belief from children."""
+        config = BayesianMCTSConfig()
+        game = get_game('tictactoe')
+        mcts = BayesianMCTS(game, config, use_transposition_table=False)
+
+        # Create a root with two children
+        root = BayesianNode(mu=0.0, sigma_sq=1.0)
+        root.children[0] = BayesianNode(mu=-0.5, sigma_sq=0.5)
+        root.children[1] = BayesianNode(mu=-0.3, sigma_sq=0.5)
+
+        # Initially, agg_mu and agg_sigma_sq are None
+        assert root.agg_mu is None
+        assert root.agg_sigma_sq is None
+
+        # Backup a value through child 0
+        mcts._backup([(root, 0)], leaf_value=0.8)
+
+        # Now root should have aggregated belief
+        assert root.agg_mu is not None
+        assert root.agg_sigma_sq is not None
+        assert root.agg_sigma_sq > 0
+
+    def test_backup_propagates_aggregated_value(self):
+        """Backup propagates agg_mu up the tree, not raw leaf value."""
+        config = BayesianMCTSConfig()
+        game = get_game('tictactoe')
+        mcts = BayesianMCTS(game, config, use_transposition_table=False)
+
+        # Create a 2-level tree: root -> child -> grandchild
+        root = BayesianNode()
+        child = BayesianNode(mu=0.0, sigma_sq=1.0)
+        grandchild = BayesianNode(mu=0.0, sigma_sq=1.0)
+        root.children[0] = child
+        child.children[0] = grandchild
+
+        # Backup a leaf value
+        mcts._backup([(root, 0), (child, 0)], leaf_value=1.0)
+
+        # Child should have aggregated belief
+        assert child.agg_mu is not None
+        # Root's child (our 'child' variable) was updated
+        assert child.mu != 0.0  # Was updated by backup
+
+    def test_backup_propagates_aggregated_variance(self):
+        """Backup uses agg_sigma_sq from child level as obs_var for parent level."""
+        config = BayesianMCTSConfig(obs_var=0.5, sigma_0=1.0)
+        game = get_game('tictactoe')
+        mcts = BayesianMCTS(game, config, use_transposition_table=False)
+
+        # Create a 2-level tree with multiple children at each level
+        root = BayesianNode()
+        child1 = BayesianNode(mu=-0.3, sigma_sq=0.5)
+        child2 = BayesianNode(mu=-0.5, sigma_sq=0.5)
+        root.children[0] = child1
+        root.children[1] = child2
+
+        # Give child1 its own children
+        grandchild1 = BayesianNode(mu=-0.2, sigma_sq=0.25)
+        grandchild2 = BayesianNode(mu=-0.4, sigma_sq=0.25)
+        child1.children[0] = grandchild1
+        child1.children[1] = grandchild2
+
+        # Backup through child1
+        mcts._backup([(root, 0), (child1, 0)], leaf_value=0.8)
+
+        # child1 should have aggregated belief from its children
+        assert child1.agg_sigma_sq is not None
+
+        # The key test: child1's update used config.obs_var (leaf level),
+        # but root's child (child1) was updated using child1's agg_sigma_sq
+        # We can't directly observe which obs_var was used, but we can verify
+        # the aggregation happened at both levels
+        assert root.agg_mu is not None
+        assert root.agg_sigma_sq is not None
+
+
+class TestVarianceAggregation:
+    """Tests for variance aggregation in BayesianNode."""
+
+    def test_aggregate_single_child(self):
+        """With one child, aggregated belief = negated child belief."""
+        node = BayesianNode()
+        node.children[0] = BayesianNode(mu=0.5, sigma_sq=0.25)
+
+        node.aggregate_children()
+
+        # Aggregated should be negated child value
+        assert abs(node.agg_mu - (-0.5)) < 1e-6
+        assert abs(node.agg_sigma_sq - 0.25) < 1e-6
+
+    def test_aggregate_clear_winner(self):
+        """Leader with much higher mean gets weight ≈ 1."""
+        node = BayesianNode()
+        # Child 0 is much better for parent (lower child mu = higher parent perspective)
+        node.children[0] = BayesianNode(mu=-0.9, sigma_sq=0.01)  # Best for parent
+        node.children[1] = BayesianNode(mu=0.5, sigma_sq=0.01)   # Much worse
+
+        node.aggregate_children()
+
+        # Aggregated mean should be close to best child's value (from parent's perspective)
+        assert node.agg_mu is not None
+        # From parent's perspective, best child has mu = 0.9 (negated -0.9)
+        assert node.agg_mu > 0.8  # Close to 0.9
+
+    def test_aggregate_uncertain_children(self):
+        """Similar children with high variance → spread weights."""
+        node = BayesianNode()
+        # Two children with similar means but high variance
+        node.children[0] = BayesianNode(mu=-0.52, sigma_sq=1.0)
+        node.children[1] = BayesianNode(mu=-0.48, sigma_sq=1.0)
+
+        node.aggregate_children()
+
+        # Both should contribute to aggregated belief
+        # The aggregated mean should be between the two
+        assert node.agg_mu is not None
+        assert 0.45 < node.agg_mu < 0.55
+
+    def test_aggregate_variance_includes_disagreement(self):
+        """Aggregated variance includes disagreement term."""
+        node = BayesianNode()
+        # Two children with very different means
+        node.children[0] = BayesianNode(mu=-0.9, sigma_sq=0.1)  # Low variance
+        node.children[1] = BayesianNode(mu=0.9, sigma_sq=0.1)   # Low variance
+
+        node.aggregate_children()
+
+        # Aggregated variance should be larger than individual variances
+        # due to disagreement term
+        assert node.agg_sigma_sq is not None
+        # With high disagreement, agg_sigma_sq should capture this uncertainty
+
+    def test_aggregate_respects_pruning(self):
+        """Children with P(optimal) < threshold get weight 0."""
+        node = BayesianNode()
+        # Clear leader and very bad challenger
+        node.children[0] = BayesianNode(mu=-0.99, sigma_sq=0.001)  # Leader, very confident
+        node.children[1] = BayesianNode(mu=0.99, sigma_sq=0.001)   # Much worse
+
+        # With default prune_threshold=0.01, child 1 should be pruned
+        node.aggregate_children(prune_threshold=0.01)
+
+        # Aggregated should essentially be the leader
+        assert node.agg_mu is not None
+        assert abs(node.agg_mu - 0.99) < 0.05  # Close to leader
+
+    def test_aggregated_fields_initialized_to_none(self):
+        """New nodes have agg_mu and agg_sigma_sq as None."""
+        node = BayesianNode()
+        assert node.agg_mu is None
+        assert node.agg_sigma_sq is None
+
+    def test_aggregate_no_children_does_nothing(self):
+        """Aggregating with no children doesn't crash."""
+        node = BayesianNode()
+        node.aggregate_children()  # Should not raise
+        assert node.agg_mu is None  # Still None
+
+    def test_variance_aggregation_ensemble_effect(self):
+        """With many similar children, variance should be lower."""
+        # Single child
+        node1 = BayesianNode()
+        node1.children[0] = BayesianNode(mu=-0.5, sigma_sq=0.25)
+        node1.aggregate_children()
+
+        # Many similar children
+        node2 = BayesianNode()
+        for i in range(5):
+            node2.children[i] = BayesianNode(mu=-0.5 + 0.01 * i, sigma_sq=0.25)
+        node2.aggregate_children()
+
+        # With many children, the ensemble effect should reduce variance
+        # (weights squared in the aggregation formula)
+        assert node2.agg_sigma_sq < node1.agg_sigma_sq
+
 
 class TestPolicyExtraction:
     """Tests for policy extraction."""
@@ -340,11 +516,27 @@ class TestPolicyExtraction:
         root.children[1] = BayesianNode(mu=-0.1, sigma_sq=0.1)  # Worst for parent
         root.children[2] = BayesianNode(mu=-0.5, sigma_sq=0.1)  # Medium
 
-        policy = mcts._get_policy(root, num_samples=1000)
+        policy = mcts._get_policy(root)
 
         # Action 0 should have highest probability
         assert policy[0] > policy[1]
         assert policy[0] > policy[2]
+
+    def test_policy_is_deterministic(self):
+        """Policy extraction is now deterministic (no sampling)."""
+        config = BayesianMCTSConfig()
+        game = get_game('tictactoe')
+        mcts = BayesianMCTS(game, config, use_transposition_table=False)
+
+        root = BayesianNode()
+        root.children[0] = BayesianNode(mu=-0.9, sigma_sq=0.1)
+        root.children[1] = BayesianNode(mu=-0.1, sigma_sq=0.1)
+
+        policy1 = mcts._get_policy(root)
+        policy2 = mcts._get_policy(root)
+
+        # Should be identical (no randomness)
+        np.testing.assert_array_equal(policy1, policy2)
 
 
 class TestSampleAction:

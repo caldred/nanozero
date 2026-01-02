@@ -24,6 +24,8 @@ class BayesianNode:
 
     Instead of tracking (visit_count, value_sum) like standard MCTS,
     maintains a Gaussian posterior (mu, sigma_sq) over the node's value.
+
+    Also maintains aggregated beliefs from children for variance aggregation.
     """
 
     def __init__(self, prior: float = 0.0, mu: float = 0.0, sigma_sq: float = 1.0):
@@ -39,6 +41,10 @@ class BayesianNode:
         self.mu = mu
         self.sigma_sq = sigma_sq
         self.children: Dict[int, BayesianNode] = {}
+
+        # Aggregated belief from children (computed after expansion/backup)
+        self.agg_mu: Optional[float] = None
+        self.agg_sigma_sq: Optional[float] = None
 
     def expanded(self) -> bool:
         """Check if node has been expanded (has children)."""
@@ -71,6 +77,78 @@ class BayesianNode:
     def precision(self) -> float:
         """Return precision (inverse variance) - proxy for visit count."""
         return 1.0 / self.sigma_sq
+
+    def aggregate_children(self, prune_threshold: float = 0.01) -> None:
+        """
+        Compute aggregated belief from all children.
+
+        Uses optimality weights (probability each child is best) and
+        variance aggregation (ensemble effect + disagreement).
+
+        The aggregated belief represents the expected value of the best child,
+        with variance reflecting both estimation uncertainty and child disagreement.
+
+        Args:
+            prune_threshold: Children with P(optimal) < threshold get weight 0
+        """
+        if not self.children:
+            return
+
+        children = list(self.children.values())
+        n = len(children)
+
+        if n == 1:
+            # Single child: aggregated belief is negated child belief
+            child = children[0]
+            self.agg_mu = -child.mu
+            self.agg_sigma_sq = child.sigma_sq
+            return
+
+        # Get child beliefs from parent's perspective (negate child values)
+        mus = np.array([-c.mu for c in children])
+        sigma_sqs = np.array([c.sigma_sq for c in children])
+
+        # Find leader and challenger by mean
+        sorted_idx = np.argsort(mus)[::-1]
+        leader_idx = sorted_idx[0]
+        challenger_idx = sorted_idx[1]
+
+        # Compute optimality scores via pairwise Gaussian CDF comparisons
+        scores = np.zeros(n)
+        mu_L, sigma_sq_L = mus[leader_idx], sigma_sqs[leader_idx]
+        mu_C, sigma_sq_C = mus[challenger_idx], sigma_sqs[challenger_idx]
+
+        for i in range(n):
+            if i == leader_idx:
+                # P(leader > challenger)
+                diff = mu_L - mu_C
+                std = math.sqrt(sigma_sq_L + sigma_sq_C)
+            else:
+                # P(child > leader)
+                diff = mus[i] - mu_L
+                std = math.sqrt(sigma_sqs[i] + sigma_sq_L)
+
+            if std > 1e-10:
+                scores[i] = normal_cdf(diff / std)
+            else:
+                scores[i] = 1.0 if diff > 0 else 0.0
+
+        # Soft prune and normalize to get weights
+        scores[scores < prune_threshold] = 0.0
+        total = scores.sum()
+        if total < 1e-10:
+            # Fallback: uniform weights
+            weights = np.ones(n) / n
+        else:
+            weights = scores / total
+
+        # Aggregated mean (weighted average of children)
+        self.agg_mu = float(np.sum(weights * mus))
+
+        # Aggregated variance (squared weights + disagreement term)
+        # This implements the ensemble effect: Σ²_parent = Σ w²_a [σ²_a + (μ_a - V_parent)²]
+        disagreement = (mus - self.agg_mu) ** 2
+        self.agg_sigma_sq = float(np.sum(weights**2 * (sigma_sqs + disagreement)))
 
 
 class BayesianMCTS:
@@ -184,6 +262,11 @@ class BayesianMCTS:
         Uses P(leader > challenger) as a lower bound on P(leader is optimal).
         For Gaussian beliefs: P(X > Y) = Φ((μ_X - μ_Y) / sqrt(σ_X² + σ_Y²))
 
+        Note: With variance aggregation, root.agg_sigma_sq also provides a
+        confidence measure. Low aggregated variance indicates high confidence.
+        However, P(leader > challenger) is more interpretable and consistent
+        with the policy extraction logic.
+
         Returns:
             True if P(leader is optimal) > confidence_threshold
         """
@@ -275,6 +358,8 @@ class BayesianMCTS:
             if cached is not None:
                 policy, value = cached
                 self._create_children_from_policy(node, state, policy, value)
+                # Initialize aggregated belief from children
+                node.aggregate_children(self.config.prune_threshold)
                 return value
 
         # Get policy and value from network
@@ -294,6 +379,8 @@ class BayesianMCTS:
 
         # Create children with logit-shifted priors
         self._create_children_from_policy(node, state, policy, value)
+        # Initialize aggregated belief from children
+        node.aggregate_children(self.config.prune_threshold)
 
         return value
 
@@ -328,7 +415,9 @@ class BayesianMCTS:
 
         for i, action in enumerate(legal_actions):
             # Logit-shifted prior mean
-            mu = value + scale * (log_probs[i] + entropy)
+            # Child nodes store values from the child's perspective (opponent),
+            # so negate the parent-perspective prior initialization.
+            mu = -value - scale * (log_probs[i] + entropy)
             # Prior variance
             sigma_sq = sigma_0 ** 2
 
@@ -395,11 +484,13 @@ class BayesianMCTS:
                     self.tt.put(states[idx], policies[j], values[j])
                 cache_hits[idx] = (policies[j], values[j])
 
-        # Create children for all roots
+        # Create children for all roots and initialize aggregated beliefs
         all_values = np.zeros(batch_size, dtype=np.float32)
         for i, root in enumerate(roots):
             policy, value = cache_hits[i]
             self._create_children_from_policy(root, states[i], policy, value)
+            # Initialize aggregated belief from children
+            root.aggregate_children(self.config.prune_threshold)
             all_values[i] = value
 
         return roots, all_values
@@ -457,33 +548,48 @@ class BayesianMCTS:
         leaf_value: float
     ) -> None:
         """
-        Bayesian backup through the tree.
+        Bayesian backup with variance aggregation.
 
-        Updates each child node on the path with the observed value,
-        negating at each level for two-player games.
+        For each level (from leaf to root):
+        1. Update visited child with observed value and propagated variance
+        2. Recompute parent's aggregated belief from all children
+        3. Propagate parent's aggregated value AND variance up
+
+        The observation variance at each level comes from the aggregated
+        variance of the level below, representing subtree uncertainty.
 
         Args:
             search_path: List of (parent_node, action) pairs from root to leaf
             leaf_value: Value at the leaf (from leaf's perspective)
         """
         value = leaf_value
+        obs_var = self.config.obs_var  # Initial variance for leaf observations
 
         for parent, action in reversed(search_path):
             child = parent.children[action]
-            # Update child's belief with observed value
-            child.update(value, self.config.obs_var, self.config.min_variance)
-            # Negate for opponent's perspective
-            value = -value
 
-    def _get_policy(self, root: BayesianNode, num_samples: int = 100) -> np.ndarray:
+            # Update child's belief with observed value and variance
+            child.update(value, obs_var, self.config.min_variance)
+
+            # Recompute parent's aggregated belief from all children
+            parent.aggregate_children(self.config.prune_threshold)
+
+            # Propagate aggregated value AND variance up
+            value = -parent.agg_mu
+            obs_var = parent.agg_sigma_sq  # Use aggregated variance for next level
+
+    def _get_policy(self, root: BayesianNode) -> np.ndarray:
         """
-        Get policy from probability of optimality.
+        Get policy from optimality weights (probability each child is best).
 
-        Draws many Thompson samples and counts how often each child wins.
+        Computes weights directly from pairwise Gaussian CDF comparisons
+        instead of drawing Thompson samples. This is:
+        - Deterministic (no random sampling)
+        - Much faster (O(n) vs O(samples * n))
+        - Directly reflects Bayesian probability of optimality
 
         Args:
             root: Root node
-            num_samples: Number of Thompson samples for policy estimation
 
         Returns:
             Policy array of shape (action_size,)
@@ -495,16 +601,50 @@ class BayesianMCTS:
 
         actions = list(root.children.keys())
         children = [root.children[a] for a in actions]
+        n = len(children)
 
-        # Draw samples and count wins (from parent's perspective)
-        for _ in range(num_samples):
-            samples = [-child.sample() for child in children]
-            winner = np.argmax(samples)
-            policy[actions[winner]] += 1
+        if n == 1:
+            policy[actions[0]] = 1.0
+            return policy
 
-        # Normalize
-        if policy.sum() > 0:
-            policy /= policy.sum()
+        # Get child beliefs from parent's perspective (negate child values)
+        mus = np.array([-c.mu for c in children])
+        sigma_sqs = np.array([c.sigma_sq for c in children])
+
+        # Find leader and challenger by mean
+        sorted_idx = np.argsort(mus)[::-1]
+        leader_idx = sorted_idx[0]
+        challenger_idx = sorted_idx[1]
+
+        # Compute optimality scores via pairwise Gaussian CDF comparisons
+        scores = np.zeros(n)
+        mu_L, sigma_sq_L = mus[leader_idx], sigma_sqs[leader_idx]
+        mu_C, sigma_sq_C = mus[challenger_idx], sigma_sqs[challenger_idx]
+
+        for i in range(n):
+            if i == leader_idx:
+                # P(leader > challenger)
+                diff = mu_L - mu_C
+                std = math.sqrt(sigma_sq_L + sigma_sq_C)
+            else:
+                # P(child > leader)
+                diff = mus[i] - mu_L
+                std = math.sqrt(sigma_sqs[i] + sigma_sq_L)
+
+            if std > 1e-10:
+                scores[i] = normal_cdf(diff / std)
+            else:
+                scores[i] = 1.0 if diff > 0 else 0.0
+
+        # Normalize to get policy (no pruning for policy output)
+        total = scores.sum()
+        if total < 1e-10:
+            # Fallback: uniform over legal actions
+            for action in actions:
+                policy[action] = 1.0 / n
+        else:
+            for i, action in enumerate(actions):
+                policy[action] = scores[i] / total
 
         return policy
 

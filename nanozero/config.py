@@ -54,11 +54,14 @@ class BayesianMCTSConfig:
     num_simulations: int = 1000
 
     # Bayesian prior hyperparameters
-    sigma_0: float = 0.03          # Prior std for logit-shifted initialization
-    obs_var: float = 0.1          # Observation variance (fixed; future: model-predicted)
+    sigma_0: float = 0.5          # Prior std for logit-shifted initialization
+    obs_var: float = 0.25          # Leaf observation variance (NN value uncertainty)
 
     # IDS hyperparameters
     ids_alpha: float = 0.0        # Pseudocount for IDS allocation
+
+    # Variance aggregation
+    prune_threshold: float = 0.01  # Soft-prune children with P(optimal) < threshold
 
     # Early stopping
     early_stopping: bool = True   # Whether to stop when confident about best action
