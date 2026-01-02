@@ -7,8 +7,9 @@ import pytest
 import torch
 from unittest.mock import Mock, patch
 
-from nanozero.config import BayesianMCTSConfig, get_game_config, get_model_config
+from nanozero.config import BayesianMCTSConfig, MCTSConfig, get_game_config, get_model_config
 from nanozero.bayesian_mcts import BayesianNode, BayesianMCTS, sample_action
+from nanozero.mcts import BatchedMCTS
 from nanozero.game import get_game
 from nanozero.model import AlphaZeroTransformer
 
@@ -186,11 +187,11 @@ class TestThompsonIDS:
         game = get_game('tictactoe')
         mcts = BayesianMCTS(game, config, use_transposition_table=False)
 
-        # Create a node with 3 children
+        # Create a node with 3 children (mu is from child's perspective)
         node = BayesianNode()
-        node.children[0] = BayesianNode(mu=0.8, sigma_sq=0.1)  # Strong
-        node.children[1] = BayesianNode(mu=0.2, sigma_sq=0.1)  # Weak
-        node.children[2] = BayesianNode(mu=0.5, sigma_sq=0.1)  # Medium
+        node.children[0] = BayesianNode(mu=-0.8, sigma_sq=0.1)  # Strong for parent
+        node.children[1] = BayesianNode(mu=-0.2, sigma_sq=0.1)  # Weak for parent
+        node.children[2] = BayesianNode(mu=-0.5, sigma_sq=0.1)  # Medium
 
         # Run selection many times
         selections = {0: 0, 1: 0, 2: 0}
@@ -198,8 +199,8 @@ class TestThompsonIDS:
             action, _ = mcts._select_child_thompson_ids(node)
             selections[action] += 1
 
-        # Action 0 (strong) should be selected most often
-        # Action 1 (weak) should be selected least often
+        # Action 0 (strong for parent) should be selected most often
+        # Action 1 (weak for parent) should be selected least often
         assert selections[0] > selections[1]
 
     def test_ids_allocation_formula(self):
@@ -237,10 +238,10 @@ class TestEarlyStopping:
         game = get_game('tictactoe')
         mcts = BayesianMCTS(game, config, use_transposition_table=False)
 
-        # Create root where leader is clearly better
+        # Create root where leader is clearly better for parent
         root = BayesianNode()
-        root.children[0] = BayesianNode(mu=0.9, sigma_sq=0.01)  # Leader, very confident
-        root.children[1] = BayesianNode(mu=0.1, sigma_sq=0.01)  # Challenger, clearly worse
+        root.children[0] = BayesianNode(mu=-0.9, sigma_sq=0.01)  # Leader, very confident
+        root.children[1] = BayesianNode(mu=-0.1, sigma_sq=0.01)  # Challenger, clearly worse
 
         assert mcts._should_stop_early(root) is True
 
@@ -250,10 +251,10 @@ class TestEarlyStopping:
         game = get_game('tictactoe')
         mcts = BayesianMCTS(game, config, use_transposition_table=False)
 
-        # Create root where leader and challenger are close
+        # Create root where leader and challenger are close for parent
         root = BayesianNode()
-        root.children[0] = BayesianNode(mu=0.55, sigma_sq=0.5)  # Slight lead, high variance
-        root.children[1] = BayesianNode(mu=0.45, sigma_sq=0.5)  # Close behind
+        root.children[0] = BayesianNode(mu=-0.55, sigma_sq=0.5)  # Slight lead, high variance
+        root.children[1] = BayesianNode(mu=-0.45, sigma_sq=0.5)  # Close behind
 
         assert mcts._should_stop_early(root) is False
 
@@ -328,16 +329,16 @@ class TestPolicyExtraction:
     """Tests for policy extraction."""
 
     def test_policy_favors_high_mu(self):
-        """Policy favors actions with high mean value."""
+        """Policy favors actions with high mean value for parent."""
         config = BayesianMCTSConfig()
         game = get_game('tictactoe')
         mcts = BayesianMCTS(game, config, use_transposition_table=False)
 
-        # Create a root with children of varying quality
+        # Create a root with children of varying quality (mu from child's perspective)
         root = BayesianNode()
-        root.children[0] = BayesianNode(mu=0.9, sigma_sq=0.1)  # Best
-        root.children[1] = BayesianNode(mu=0.1, sigma_sq=0.1)  # Worst
-        root.children[2] = BayesianNode(mu=0.5, sigma_sq=0.1)  # Medium
+        root.children[0] = BayesianNode(mu=-0.9, sigma_sq=0.1)  # Best for parent
+        root.children[1] = BayesianNode(mu=-0.1, sigma_sq=0.1)  # Worst for parent
+        root.children[2] = BayesianNode(mu=-0.5, sigma_sq=0.1)  # Medium
 
         policy = mcts._get_policy(root, num_samples=1000)
 
@@ -472,6 +473,110 @@ class TestIntegration:
         # Check that TT was used
         hits, misses, size = mcts.tt.stats()
         assert size > 0  # Some positions cached
+
+
+class TestPUCTVsThompsonComparison:
+    """Comparison tests between PUCT and Thompson sampling MCTS."""
+
+    class DummyUniformModel(torch.nn.Module):
+        """Uniform-policy, zero-value model for controlled comparisons."""
+
+        def __init__(self, action_size: int):
+            super().__init__()
+            self.action_size = action_size
+            self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+        def predict(self, x, action_mask=None):
+            batch = x.shape[0]
+            if action_mask is None:
+                probs = torch.full((batch, self.action_size), 1.0 / self.action_size)
+            else:
+                mask = action_mask.float()
+                probs = mask / mask.sum(dim=-1, keepdim=True)
+            values = torch.zeros((batch, 1))
+            return probs, values
+
+    def test_thompson_handles_two_close_wins_connect4(self):
+        """Thompson balances two winning moves better than PUCT in Connect4."""
+        np.random.seed(0)
+        torch.manual_seed(0)
+
+        game = get_game('connect4')
+        model = self.DummyUniformModel(game.config.action_size)
+
+        # Two immediate winning moves for current player (columns 0 and 6).
+        state = np.zeros((6, 7), dtype=np.int8)
+        state[5, 0] = 1
+        state[4, 0] = 1
+        state[3, 0] = 1
+        state[5, 6] = 1
+        state[4, 6] = 1
+        state[3, 6] = 1
+        state[5, 1] = -1
+        state[4, 1] = -1
+        state[3, 1] = -1
+        state[5, 2] = -1
+        state[4, 2] = -1
+        state[3, 2] = -1
+
+        states = state[np.newaxis, ...]
+        winning_actions = [0, 6]
+
+        for action in winning_actions:
+            assert action in game.legal_actions(state)
+            assert game.is_terminal(game.next_state(state, action))
+
+        puct = BatchedMCTS(game, MCTSConfig(num_simulations=20, c_puct=1.0))
+        policy_puct = puct.search(states, model, add_noise=False, batch_size=1)[0]
+
+        bayes = BayesianMCTS(
+            game,
+            BayesianMCTSConfig(num_simulations=20, early_stopping=False),
+            use_transposition_table=False
+        )
+        policy_bayes = bayes.search(states, model)[0]
+
+        target = np.zeros(game.config.action_size, dtype=np.float32)
+        target[winning_actions[0]] = 0.5
+        target[winning_actions[1]] = 0.5
+        eps = 1e-8
+        kl_puct = np.sum(target * np.log((target + eps) / (policy_puct + eps)))
+        kl_bayes = np.sum(target * np.log((target + eps) / (policy_bayes + eps)))
+
+        assert kl_bayes < kl_puct
+
+    def test_thompson_identifies_best_move_faster_connect4(self):
+        """Thompson assigns higher mass to the best trap sooner than PUCT."""
+        np.random.seed(0)
+        torch.manual_seed(0)
+
+        game = get_game('connect4')
+        model = self.DummyUniformModel(game.config.action_size)
+
+        # Best move is column 3 (win in 3), while columns 1/4 win slower (win in 5).
+        state = np.array([
+            [0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 1, 0, 0],
+            [0, 1, 0, 0, 1, -1, -1],
+            [-1, -1, -1, 1, -1, -1, 1],
+            [1, 1, -1, 1, -1, 1, -1],
+        ], dtype=np.int8)
+        states = state[np.newaxis, ...]
+        best_action = 3
+
+        puct = BatchedMCTS(game, MCTSConfig(num_simulations=10, c_puct=1.0))
+        policy_puct = puct.search(states, model, add_noise=False, batch_size=1)[0]
+
+        np.random.seed(0)
+        bayes = BayesianMCTS(
+            game,
+            BayesianMCTSConfig(num_simulations=10, early_stopping=False),
+            use_transposition_table=False
+        )
+        policy_bayes = bayes.search(states, model)[0]
+
+        assert policy_bayes[best_action] > policy_puct[best_action]
 
 
 if __name__ == '__main__':

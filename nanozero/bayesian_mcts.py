@@ -190,14 +190,14 @@ class BayesianMCTS:
         if len(root.children) <= 1:
             return True  # Only one action, we're done
 
-        # Find leader and challenger by mean value
+        # Find leader and challenger by mean value (from parent's perspective)
         children = list(root.children.values())
-        children.sort(key=lambda c: c.mu, reverse=True)
+        children.sort(key=lambda c: -c.mu, reverse=True)
         leader = children[0]
         challenger = children[1]
 
         # P(leader > challenger) using Gaussian CDF
-        mu_diff = leader.mu - challenger.mu
+        mu_diff = (-leader.mu) - (-challenger.mu)
         std_diff = math.sqrt(leader.sigma_sq + challenger.sigma_sq)
 
         if std_diff < 1e-10:
@@ -427,8 +427,8 @@ class BayesianMCTS:
         if len(children) == 1:
             return children[0]
 
-        # Draw Thompson samples
-        samples = [(action, child, child.sample()) for action, child in children]
+        # Draw Thompson samples (from parent's perspective)
+        samples = [(action, child, -child.sample()) for action, child in children]
         samples.sort(key=lambda x: x[2], reverse=True)
 
         # Leader and Challenger
@@ -496,9 +496,9 @@ class BayesianMCTS:
         actions = list(root.children.keys())
         children = [root.children[a] for a in actions]
 
-        # Draw samples and count wins
+        # Draw samples and count wins (from parent's perspective)
         for _ in range(num_samples):
-            samples = [child.sample() for child in children]
+            samples = [-child.sample() for child in children]
             winner = np.argmax(samples)
             policy[actions[winner]] += 1
 
