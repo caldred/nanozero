@@ -733,32 +733,33 @@ class BayesianMCTS:
         Bayesian backup with variance aggregation.
 
         For each level (from leaf to root):
-        1. Update visited child with observed value and propagated variance
+        1. Update visited child with observed value
         2. Recompute parent's aggregated belief from all children
-        3. Propagate parent's aggregated value AND variance up
+        3. Propagate parent's aggregated value up
 
-        The observation variance at each level comes from the aggregated
-        variance of the level below, representing subtree uncertainty.
+        Note: We use FIXED obs_var (from config) rather than propagating
+        agg_sigma_sq. The aggregated variance formula (sum of w^2 * sigma^2)
+        produces values ~7x smaller than the configured obs_var, which was
+        causing updates to overwhelm the prior initialization too quickly.
 
         Args:
             search_path: List of (parent_node, action) pairs from root to leaf
             leaf_value: Value at the leaf (from leaf's perspective)
         """
         value = leaf_value
-        obs_var = self.config.obs_var  # Initial variance for leaf observations
+        obs_var = self.config.obs_var  # Fixed observation variance
 
         for parent, action in reversed(search_path):
             child = parent.children[action]
 
-            # Update child's belief with observed value and variance
+            # Update child's belief with observed value
             child.update(value, obs_var, self.config.min_variance)
 
             # Recompute parent's aggregated belief from all children
             parent.aggregate_children(self.config.prune_threshold)
 
-            # Propagate aggregated value AND variance up
+            # Propagate aggregated value up (but keep obs_var fixed)
             value = -parent.agg_mu
-            obs_var = parent.agg_sigma_sq  # Use aggregated variance for next level
 
     def _get_policy(self, root: BayesianNode) -> np.ndarray:
         """
