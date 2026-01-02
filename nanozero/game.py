@@ -571,16 +571,216 @@ class Go(Game):
         return '\n'.join(lines)
 
 
-def get_game(name: str) -> Game:
-    """Factory function to get a game instance."""
+def get_game(name: str, use_rust: bool = True) -> Game:
+    """
+    Factory function to get a game instance.
+
+    Args:
+        name: Game name ('tictactoe', 'connect4', 'go9x9', 'go19x19')
+        use_rust: Whether to use Rust implementation if available (default True)
+
+    Returns:
+        Game instance
+    """
     from nanozero.config import get_game_config
     config = get_game_config(name)
-    games = {
+
+    # Try Rust implementations if requested
+    if use_rust and RUST_AVAILABLE:
+        rust_games = {
+            'tictactoe': lambda cfg: RustTicTacToeWrapper(cfg),
+            'connect4': lambda cfg: RustConnect4Wrapper(cfg),
+            'go9x9': lambda cfg: RustGoWrapper(cfg),
+            'go19x19': lambda cfg: RustGoWrapper(cfg),
+        }
+        if name in rust_games:
+            return rust_games[name](config)
+
+    # Fall back to Python implementations
+    python_games = {
         'tictactoe': TicTacToe,
         'connect4': Connect4,
         'go9x9': Go,
         'go19x19': Go,
     }
-    if name not in games:
+    if name not in python_games:
         raise ValueError(f"Unknown game: {name}")
-    return games[name](config)
+    return python_games[name](config)
+
+
+# ============================================================================
+# Rust Integration
+# ============================================================================
+
+# Try to import Rust module
+try:
+    from nanozero_mcts_rs import RustTicTacToe, RustConnect4, RustGo
+    RUST_AVAILABLE = True
+except ImportError:
+    RUST_AVAILABLE = False
+
+
+class RustTicTacToeWrapper(Game):
+    """TicTacToe using Rust backend with Python Game interface."""
+
+    def __init__(self, config: GameConfig):
+        super().__init__(config)
+        if not RUST_AVAILABLE:
+            raise ImportError("nanozero_mcts_rs not installed")
+        self._rust = RustTicTacToe()
+
+    def initial_state(self) -> np.ndarray:
+        return self._rust.initial_state().reshape(3, 3)
+
+    def current_player(self, state: np.ndarray) -> int:
+        return int(self._rust.current_player(state.flatten()))
+
+    def legal_actions(self, state: np.ndarray) -> List[int]:
+        return [int(a) for a in self._rust.legal_actions(state.flatten())]
+
+    def legal_actions_mask(self, state: np.ndarray) -> np.ndarray:
+        mask = np.array(self._rust.legal_actions_mask(state.flatten()), dtype=np.float32)
+        return mask
+
+    def next_state(self, state: np.ndarray, action: int) -> np.ndarray:
+        return self._rust.next_state(state.flatten(), action).reshape(3, 3)
+
+    def is_terminal(self, state: np.ndarray) -> bool:
+        return self._rust.is_terminal(state.flatten())
+
+    def terminal_reward(self, state: np.ndarray) -> float:
+        return float(self._rust.terminal_reward(state.flatten()))
+
+    def canonical_state(self, state: np.ndarray) -> np.ndarray:
+        return self._rust.canonical_state(state.flatten()).reshape(3, 3)
+
+    def to_tensor(self, state: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(self._rust.to_tensor(state.flatten()))
+
+    def symmetries(self, state: np.ndarray, policy: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+        # Use Python implementation for symmetries (complex to wrap)
+        result = []
+        pb = policy.reshape(3, 3)
+        for i in range(4):
+            rs = np.rot90(state, i)
+            rp = np.rot90(pb, i)
+            result.append((rs.copy(), rp.flatten().copy()))
+            result.append((np.fliplr(rs).copy(), np.fliplr(rp).flatten().copy()))
+        return result
+
+    def display(self, state: np.ndarray) -> str:
+        return self._rust.render(state.flatten())
+
+
+class RustConnect4Wrapper(Game):
+    """Connect4 using Rust backend with Python Game interface."""
+
+    def __init__(self, config: GameConfig):
+        super().__init__(config)
+        if not RUST_AVAILABLE:
+            raise ImportError("nanozero_mcts_rs not installed")
+        self._rust = RustConnect4()
+
+    def initial_state(self) -> np.ndarray:
+        return self._rust.initial_state().reshape(6, 7)
+
+    def current_player(self, state: np.ndarray) -> int:
+        return int(self._rust.current_player(state.flatten()))
+
+    def legal_actions(self, state: np.ndarray) -> List[int]:
+        return [int(a) for a in self._rust.legal_actions(state.flatten())]
+
+    def legal_actions_mask(self, state: np.ndarray) -> np.ndarray:
+        mask = np.array(self._rust.legal_actions_mask(state.flatten()), dtype=np.float32)
+        return mask
+
+    def next_state(self, state: np.ndarray, action: int) -> np.ndarray:
+        return self._rust.next_state(state.flatten(), action).reshape(6, 7)
+
+    def is_terminal(self, state: np.ndarray) -> bool:
+        return self._rust.is_terminal(state.flatten())
+
+    def terminal_reward(self, state: np.ndarray) -> float:
+        return float(self._rust.terminal_reward(state.flatten()))
+
+    def canonical_state(self, state: np.ndarray) -> np.ndarray:
+        return self._rust.canonical_state(state.flatten()).reshape(6, 7)
+
+    def to_tensor(self, state: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(self._rust.to_tensor(state.flatten()))
+
+    def symmetries(self, state: np.ndarray, policy: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+        return [
+            (state.copy(), policy.copy()),
+            (np.fliplr(state).copy(), np.flip(policy).copy()),
+        ]
+
+    def display(self, state: np.ndarray) -> str:
+        return self._rust.render(state.flatten())
+
+
+class RustGoWrapper(Game):
+    """Go using Rust backend with Python Game interface."""
+
+    def __init__(self, config: GameConfig):
+        super().__init__(config)
+        if not RUST_AVAILABLE:
+            raise ImportError("nanozero_mcts_rs not installed")
+        self.height = config.board_height
+        self.width = config.board_width
+        self._rust = RustGo(self.height)
+
+    def initial_state(self) -> np.ndarray:
+        return np.array(self._rust.initial_state(), dtype=np.int8)
+
+    def current_player(self, state: np.ndarray) -> int:
+        return int(self._rust.current_player(state))
+
+    def legal_actions(self, state: np.ndarray) -> List[int]:
+        return [int(a) for a in self._rust.legal_actions(state)]
+
+    def legal_actions_mask(self, state: np.ndarray) -> np.ndarray:
+        mask = np.array(self._rust.legal_actions_mask(state), dtype=np.float32)
+        return mask
+
+    def next_state(self, state: np.ndarray, action: int) -> np.ndarray:
+        return np.array(self._rust.next_state(state, action), dtype=np.int8)
+
+    def is_terminal(self, state: np.ndarray) -> bool:
+        return self._rust.is_terminal(state)
+
+    def terminal_reward(self, state: np.ndarray) -> float:
+        return float(self._rust.terminal_reward(state))
+
+    def canonical_state(self, state: np.ndarray) -> np.ndarray:
+        return np.array(self._rust.canonical_state(state), dtype=np.int8)
+
+    def to_tensor(self, state: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(self._rust.to_tensor(state))
+
+    def symmetries(self, state: np.ndarray, policy: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+        # Use Python implementation for symmetries
+        board = state[:self.height, :]
+        metadata = state[self.height:, :]
+        pass_action = self.height * self.width
+        policy_board = policy[:pass_action].reshape(self.height, self.width)
+        pass_prob = policy[pass_action]
+
+        results = []
+        for i in range(4):
+            rot_board = np.rot90(board, i)
+            rot_policy = np.rot90(policy_board, i)
+            rot_state = np.vstack([rot_board, metadata])
+            rot_policy_flat = np.append(rot_policy.flatten(), pass_prob)
+            results.append((rot_state.copy(), rot_policy_flat.copy()))
+
+            flip_board = np.fliplr(rot_board)
+            flip_policy = np.fliplr(rot_policy)
+            flip_state = np.vstack([flip_board, metadata])
+            flip_policy_flat = np.append(flip_policy.flatten(), pass_prob)
+            results.append((flip_state.copy(), flip_policy_flat.copy()))
+
+        return results
+
+    def display(self, state: np.ndarray) -> str:
+        return self._rust.render(state)
