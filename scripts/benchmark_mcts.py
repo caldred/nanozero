@@ -104,13 +104,13 @@ def get_test_positions(game: Game, game_name: str) -> Dict[str, np.ndarray]:
 
         # A few moves in
         state = game.initial_state()
-        for move in [3, 3, 4, 4, 2]:
+        for move in [4, 5, 2, 3, 6, 5, 6]:
             state = game.next_state(state, move)
         positions['midgame_1'] = state
 
         # More developed
         state = game.initial_state()
-        for move in [3, 3, 3, 4, 4, 4, 2, 2, 5, 5]:
+        for move in [4, 5, 2, 3, 6, 5, 6]:
             state = game.next_state(state, move)
         positions['midgame_2'] = state
 
@@ -292,6 +292,7 @@ def main():
 
     # Load game and model
     game = get_game(args.game)
+    print(f"Game: {args.game} (backend: {game.backend})")
     model_config = get_model_config(game.config, n_layer=args.n_layer)
     model = AlphaZeroTransformer(model_config).to(device)
 

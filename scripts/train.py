@@ -300,7 +300,7 @@ def main():
 
     # Create game
     game = get_game(args.game)
-    print0(f"Game: {args.game}")
+    print0(f"Game: {args.game} (backend: {game.backend})")
     print0(f"Board size: {game.config.board_size}, Action size: {game.config.action_size}")
 
     # Create model

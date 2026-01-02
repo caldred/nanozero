@@ -594,7 +594,9 @@ def get_game(name: str, use_rust: bool = True) -> Game:
             'go19x19': lambda cfg: RustGoWrapper(cfg),
         }
         if name in rust_games:
-            return rust_games[name](config)
+            game = rust_games[name](config)
+            game.backend = 'rust'
+            return game
 
     # Fall back to Python implementations
     python_games = {
@@ -605,7 +607,14 @@ def get_game(name: str, use_rust: bool = True) -> Game:
     }
     if name not in python_games:
         raise ValueError(f"Unknown game: {name}")
-    return python_games[name](config)
+    game = python_games[name](config)
+    game.backend = 'python'
+    return game
+
+
+def is_rust_available() -> bool:
+    """Check if the Rust backend is available."""
+    return RUST_AVAILABLE
 
 
 # ============================================================================

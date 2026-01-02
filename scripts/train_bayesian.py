@@ -164,7 +164,7 @@ def main():
 
     # Create game
     game = get_game('tictactoe')
-    print0(f"Game: tictactoe")
+    print0(f"Game: tictactoe (backend: {game.backend})")
 
     # Create small model for quick testing
     model_config = get_model_config(game.config, n_layer=2)

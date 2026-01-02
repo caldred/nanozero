@@ -220,6 +220,7 @@ def main():
     device = get_device() if args.device == 'auto' else torch.device(args.device)
 
     game = get_game(args.game)
+    print(f"Game: {args.game} (backend: {game.backend})")
     model_config = get_model_config(game.config, n_layer=args.n_layer)
 
     if args.mcts_comparison:

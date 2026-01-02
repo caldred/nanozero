@@ -430,12 +430,13 @@ def main():
 
     # Load game and model
     game = get_game(args.game)
+    print(f"Game: {args.game} (backend: {game.backend})")
     model_config = get_model_config(game.config, n_layer=args.n_layer)
     model = AlphaZeroTransformer(model_config).to(device)
     load_checkpoint(args.checkpoint, model)
     model.eval()
 
-    print(f"Root-Level MCTS Bandit Comparison: {args.game}")
+    print(f"Root-Level MCTS Bandit Comparison")
     print(f"Model: {args.checkpoint}")
     print(f"Pulls: {args.n_pulls}, Trials: {args.n_trials}, Positions: {args.n_positions}")
     print()

@@ -99,6 +99,7 @@ def main():
 
     # Load game and model
     game = get_game(args.game)
+    print(f"Game: {args.game} (backend: {game.backend})")
     model_config = get_model_config(game.config, n_layer=args.n_layer)
     model = AlphaZeroTransformer(model_config).to(device)
 
@@ -108,7 +109,7 @@ def main():
     mcts_config = MCTSConfig(num_simulations=100, temperature=0)
     mcts = BatchedMCTS(game, mcts_config)
 
-    print(f"Loaded {args.game} model from {args.checkpoint}")
+    print(f"Loaded model from {args.checkpoint}")
     print(f"Model has {model.count_parameters():,} parameters")
 
     # Play games

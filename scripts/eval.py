@@ -165,6 +165,7 @@ def main():
 
     # Load game and model
     game = get_game(args.game)
+    print0(f"Game: {args.game} (backend: {game.backend})")
     model_config = get_model_config(game.config, n_layer=args.n_layer)
     model = AlphaZeroTransformer(model_config).to(device)
 
@@ -174,7 +175,7 @@ def main():
     mcts_config = MCTSConfig(num_simulations=args.mcts_simulations)
     mcts = BatchedMCTS(game, mcts_config)
 
-    print0(f"Evaluating {args.game} model from {args.checkpoint}")
+    print0(f"Evaluating model from {args.checkpoint}")
     print0(f"Playing {args.num_games} games against each opponent\n")
 
     # Evaluate against different opponents
