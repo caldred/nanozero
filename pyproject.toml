@@ -31,6 +31,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
+rust = [
+    "nanozero-mcts-rs>=0.1.0",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
