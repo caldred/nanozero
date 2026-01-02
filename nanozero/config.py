@@ -51,14 +51,14 @@ class BayesianMCTSConfig:
     Note: No Dirichlet noise - Thompson sampling provides exploration naturally.
     Note: No temperature - policy is probability of optimality via Thompson sampling.
     """
-    num_simulations: int = 100
+    num_simulations: int = 1000
 
     # Bayesian prior hyperparameters
-    sigma_0: float = 1.0          # Prior std for logit-shifted initialization
-    obs_var: float = 0.5          # Observation variance (fixed; future: model-predicted)
+    sigma_0: float = 0.3          # Prior std for logit-shifted initialization
+    obs_var: float = 0.1          # Observation variance (fixed; future: model-predicted)
 
     # IDS hyperparameters
-    ids_alpha: float = 0.5        # Pseudocount for IDS allocation
+    ids_alpha: float = 0.0        # Pseudocount for IDS allocation
 
     # Early stopping
     early_stopping: bool = True   # Whether to stop when confident about best action
