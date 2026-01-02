@@ -55,7 +55,7 @@ class BayesianMCTSConfig:
 
     # Bayesian prior hyperparameters
     sigma_0: float = 0.5          # Prior std for logit-shifted initialization
-    obs_var: float = 4.0          # Observation variance (higher = prior matters more)
+    obs_var: float = 0.25         # Observation variance (NN value uncertainty)
 
     # IDS hyperparameters
     ids_alpha: float = 0.0        # Pseudocount for IDS allocation
