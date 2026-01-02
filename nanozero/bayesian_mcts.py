@@ -194,11 +194,15 @@ class BayesianMCTS:
         num_simulations: Optional[int] = None
     ) -> np.ndarray:
         """
-        Run Bayesian MCTS on a batch of states.
+        Run Bayesian MCTS on a batch of states with interleaved batching.
 
-        Unlike BatchedMCTS, simulations run sequentially per state since
-        Thompson sampling provides natural exploration without virtual loss.
-        No Dirichlet noise is needed - Thompson sampling explores naturally.
+        Batches NN calls across all game states by interleaving simulations:
+        for each simulation round, we select leaves from ALL states, batch
+        expand them together, then backup each independently.
+
+        This is much more GPU-efficient than processing states sequentially,
+        while still maintaining correct Thompson sampling behavior (beliefs
+        are updated between simulation rounds).
 
         Supports early stopping when confident about the best action.
 
@@ -235,23 +239,66 @@ class BayesianMCTS:
             return policies
 
         # Batch expand roots for non-terminal states
-        non_terminal_states = np.stack(non_terminal_states)
-        roots, _ = self._batch_expand_roots(non_terminal_states, model, device)
+        non_terminal_states_arr = np.stack(non_terminal_states)
+        roots, _ = self._batch_expand_roots(non_terminal_states_arr, model, device)
 
-        # Run simulations sequentially per state
-        for idx, (state_idx, root) in enumerate(zip(non_terminal_indices, roots)):
-            state = states[state_idx]
+        # Track which states are still active (not stopped early)
+        active_mask = [True] * len(roots)
 
-            for sim in range(num_simulations):
-                self._run_simulation(root, state, model, device)
+        # Interleaved simulation loop
+        for sim in range(num_simulations):
+            # Collect leaves from all active states
+            leaves_to_expand = []  # (local_idx, node, state)
+            terminal_backups = []  # (local_idx, search_path, value)
+            expansion_backups = []  # (local_idx, search_path) - value filled after batch expand
 
-                # Early stopping check
-                if (self.config.early_stopping and
-                    sim >= self.config.min_simulations - 1 and
-                    self._should_stop_early(root)):
+            for local_idx in range(len(roots)):
+                if not active_mask[local_idx]:
+                    continue
+
+                root = roots[local_idx]
+                state = non_terminal_states[local_idx]
+
+                # Select to leaf
+                leaf_node, search_path, leaf_state, is_terminal = self._select_to_leaf(root, state)
+
+                if is_terminal:
+                    # Terminal state: backup immediately with game reward
+                    value = self.game.terminal_reward(leaf_state)
+                    terminal_backups.append((local_idx, search_path, value))
+                elif not leaf_node.expanded():
+                    # Unexpanded leaf: queue for batch expansion
+                    leaves_to_expand.append((local_idx, leaf_node, leaf_state))
+                    expansion_backups.append((local_idx, search_path))
+                # else: already expanded (rare, can happen with early stopping)
+
+            # Batch expand all unexpanded leaves
+            if leaves_to_expand:
+                nodes = [item[1] for item in leaves_to_expand]
+                leaf_states = [item[2] for item in leaves_to_expand]
+                values = self._batch_expand_leaves(nodes, leaf_states, model, device)
+
+                # Backup expanded leaves
+                for (local_idx, search_path), value in zip(expansion_backups, values):
+                    self._backup(search_path, value)
+
+            # Backup terminal leaves
+            for local_idx, search_path, value in terminal_backups:
+                self._backup(search_path, value)
+
+            # Early stopping check for each state
+            if self.config.early_stopping and sim >= self.config.min_simulations - 1:
+                for local_idx in range(len(roots)):
+                    if active_mask[local_idx] and self._should_stop_early(roots[local_idx]):
+                        active_mask[local_idx] = False
+
+                # If all states stopped early, exit loop
+                if not any(active_mask):
                     break
 
-            policies[state_idx] = self._get_policy(root)
+        # Extract policies from all roots
+        for local_idx, state_idx in enumerate(non_terminal_indices):
+            policies[state_idx] = self._get_policy(roots[local_idx])
 
         return policies
 
@@ -327,6 +374,38 @@ class BayesianMCTS:
 
         # BACKUP: propagate value up the tree
         self._backup(search_path, value)
+
+    def _select_to_leaf(
+        self,
+        root: BayesianNode,
+        state: np.ndarray
+    ) -> Tuple[BayesianNode, List[Tuple[BayesianNode, int]], np.ndarray, bool]:
+        """
+        Select from root to leaf without expansion.
+
+        Used for batched search where we collect all leaves first,
+        then batch expand them together.
+
+        Args:
+            root: Root node to start from
+            state: Game state at root
+
+        Returns:
+            Tuple of (leaf_node, search_path, leaf_state, is_terminal)
+        """
+        node = root
+        search_path: List[Tuple[BayesianNode, int]] = []
+        current_state = state.copy()
+
+        # SELECT: traverse until unexpanded node or terminal
+        while node.expanded() and not self.game.is_terminal(current_state):
+            action, child = self._select_child_thompson_ids(node)
+            search_path.append((node, action))
+            current_state = self.game.next_state(current_state, action)
+            node = child
+
+        is_terminal = self.game.is_terminal(current_state)
+        return node, search_path, current_state, is_terminal
 
     def _expand(
         self,
@@ -426,6 +505,109 @@ class BayesianMCTS:
                 mu=mu,
                 sigma_sq=sigma_sq
             )
+
+    def _batch_expand_leaves(
+        self,
+        nodes: List[BayesianNode],
+        states: List[np.ndarray],
+        model: torch.nn.Module,
+        device: torch.device
+    ) -> List[float]:
+        """
+        Expand multiple leaf nodes in a single batched NN call.
+
+        Uses transposition table for cache hits and deduplication.
+
+        Args:
+            nodes: List of leaf nodes to expand
+            states: List of states corresponding to each node
+            model: Neural network
+            device: Device for inference
+
+        Returns:
+            List of values for each leaf
+        """
+        batch_size = len(nodes)
+        if batch_size == 0:
+            return []
+
+        results = [None] * batch_size
+
+        # Check transposition table for cache hits
+        miss_indices = []
+        miss_canonical_keys = []
+
+        for i in range(batch_size):
+            state = states[i]
+            node = nodes[i]
+
+            if self.tt:
+                cached = self.tt.get(state)
+                if cached is not None:
+                    policy, value = cached
+                    self._create_children_from_policy(node, state, policy, value)
+                    node.aggregate_children(self.config.prune_threshold)
+                    results[i] = value
+                    continue
+
+            # Cache miss - record for batch evaluation
+            if self.tt:
+                canonical_key, _ = self.tt._canonical_key(state)
+                miss_canonical_keys.append(canonical_key)
+            miss_indices.append(i)
+
+        # Batch evaluate cache misses
+        if miss_indices:
+            # Deduplicate by canonical key if using transposition table
+            if self.tt and miss_canonical_keys:
+                unique_keys = {}
+                for j, (idx, key) in enumerate(zip(miss_indices, miss_canonical_keys)):
+                    if key not in unique_keys:
+                        unique_keys[key] = j
+                unique_local_indices = list(unique_keys.values())
+            else:
+                unique_local_indices = list(range(len(miss_indices)))
+
+            # Prepare batch tensors for unique positions
+            unique_states = [states[miss_indices[j]] for j in unique_local_indices]
+
+            state_tensors = torch.stack([
+                self.game.to_tensor(self.game.canonical_state(s)) for s in unique_states
+            ]).to(device)
+
+            action_masks = torch.stack([
+                torch.from_numpy(self.game.legal_actions_mask(s))
+                for s in unique_states
+            ]).float().to(device)
+
+            # Single batched NN call
+            policies, values = model.predict(state_tensors, action_masks)
+            policies = policies.cpu().numpy()
+            values = values.cpu().numpy().flatten()
+
+            # Store unique results in cache
+            if self.tt:
+                for j, state in enumerate(unique_states):
+                    self.tt.put(state, policies[j], values[j])
+
+            # Expand all miss nodes (may reuse cached results for duplicates)
+            for idx in miss_indices:
+                state = states[idx]
+                node = nodes[idx]
+
+                if self.tt:
+                    policy, value = self.tt.get(state)
+                else:
+                    # Find position in unique_states
+                    local_idx = miss_indices.index(idx)
+                    policy = policies[local_idx]
+                    value = values[local_idx]
+
+                self._create_children_from_policy(node, state, policy, value)
+                node.aggregate_children(self.config.prune_threshold)
+                results[idx] = value
+
+        return results
 
     def _batch_expand_roots(
         self,
