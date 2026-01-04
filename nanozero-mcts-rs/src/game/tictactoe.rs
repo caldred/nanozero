@@ -242,9 +242,11 @@ impl Game for TicTacToe {
     }
 
     fn map_action(&self, action: u16, symmetry_idx: usize) -> u16 {
-        // Symmetry indices: 0-3 are rotations, 4-7 are flipped + rotations
-        let rotations = symmetry_idx % 4;
-        let flipped = symmetry_idx >= 4;
+        // Symmetry indices match symmetries() order:
+        // 0,2,4,6 = rotations 0,1,2,3 without flip
+        // 1,3,5,7 = rotations 0,1,2,3 with flip
+        let rotations = symmetry_idx / 2;
+        let flipped = symmetry_idx % 2 == 1;
 
         let mut a = action as usize;
         // Apply rotations
@@ -258,8 +260,8 @@ impl Game for TicTacToe {
 
     fn unmap_action(&self, action: u16, symmetry_idx: usize) -> u16 {
         // Inverse of map_action: undo flip, then undo rotation
-        let rotations = symmetry_idx % 4;
-        let flipped = symmetry_idx >= 4;
+        let rotations = symmetry_idx / 2;
+        let flipped = symmetry_idx % 2 == 1;
 
         let mut a = action as usize;
         // Undo flip first (flip is self-inverse)
@@ -368,5 +370,145 @@ mod tests {
         let canonical = game.canonical_state(&state);
         let c = canonical.as_tictactoe();
         assert_eq!(c.board[0], -1); // X's piece becomes -1
+    }
+
+    #[test]
+    fn test_map_unmap_action_roundtrip() {
+        let game = TicTacToe::new();
+        // For all symmetries and actions, map then unmap should give identity
+        for sym_idx in 0..8 {
+            for action in 0..9u16 {
+                let mapped = game.map_action(action, sym_idx);
+                let unmapped = game.unmap_action(mapped, sym_idx);
+                assert_eq!(
+                    unmapped, action,
+                    "map_action/unmap_action roundtrip failed for sym={}, action={}",
+                    sym_idx, action
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_map_action_symmetry_consistency() {
+        let game = TicTacToe::new();
+        // Create a state with a piece at position 0 (top-left)
+        let mut state = game.initial_state();
+        state = game.next_state(&state, 0);
+
+        let policy = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let syms = game.symmetries(&state, &policy);
+
+        // For each symmetry, map_action(0) should point to where the piece moved
+        for (sym_idx, (sym_state, sym_policy)) in syms.iter().enumerate() {
+            let mapped_action = game.map_action(0, sym_idx);
+            // The symmetric policy should have 1.0 at mapped_action
+            assert!(
+                (sym_policy[mapped_action as usize] - 1.0).abs() < 1e-6,
+                "sym_idx={}: map_action(0)={} but policy has 1.0 at {:?}",
+                sym_idx,
+                mapped_action,
+                sym_policy
+                    .iter()
+                    .position(|&p| (p - 1.0).abs() < 1e-6)
+            );
+            // The symmetric state should have the piece at mapped_action
+            let s = sym_state.as_tictactoe();
+            assert_eq!(
+                s.board[mapped_action as usize], 1,
+                "sym_idx={}: piece not at mapped_action={}",
+                sym_idx, mapped_action
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_symmetry_index() {
+        use crate::game::compute_hash;
+
+        let game = TicTacToe::new();
+        // Create a state with a piece at corner
+        let mut state = game.initial_state();
+        state = game.next_state(&state, 0);
+
+        let (sym_idx, canonical_hash) = game.canonical_symmetry_index(&state);
+
+        // Verify this is the minimum hash among symmetries
+        let policy = vec![0.0f32; 9];
+        let syms = game.symmetries(&state, &policy);
+        for (idx, (sym_state, _)) in syms.iter().enumerate() {
+            let hash = compute_hash(sym_state);
+            if idx == sym_idx {
+                assert_eq!(hash, canonical_hash);
+            } else {
+                assert!(hash >= canonical_hash, "Found smaller hash at idx {}", idx);
+            }
+        }
+    }
+
+    #[test]
+    fn test_symmetric_states_same_canonical_hash() {
+        let game = TicTacToe::new();
+
+        // Create different starting positions that are symmetric
+        // Corner positions: 0, 2, 6, 8 are all equivalent under symmetry
+        for &action in &[0u16, 2, 6, 8] {
+            let mut state = game.initial_state();
+            state = game.next_state(&state, action);
+            let (_, hash) = game.canonical_symmetry_index(&state);
+
+            // All corner openings should have the same canonical hash
+            let mut state0 = game.initial_state();
+            state0 = game.next_state(&state0, 0);
+            let (_, hash0) = game.canonical_symmetry_index(&state0);
+
+            assert_eq!(
+                hash, hash0,
+                "Corner opening at {} should have same canonical hash as opening at 0",
+                action
+            );
+        }
+
+        // Edge positions: 1, 3, 5, 7 are all equivalent under symmetry
+        for &action in &[1u16, 3, 5, 7] {
+            let mut state = game.initial_state();
+            state = game.next_state(&state, action);
+            let (_, hash) = game.canonical_symmetry_index(&state);
+
+            let mut state1 = game.initial_state();
+            state1 = game.next_state(&state1, 1);
+            let (_, hash1) = game.canonical_symmetry_index(&state1);
+
+            assert_eq!(
+                hash, hash1,
+                "Edge opening at {} should have same canonical hash as opening at 1",
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn test_distinct_positions_different_hashes() {
+        let game = TicTacToe::new();
+
+        // Corner opening (position 0)
+        let mut corner = game.initial_state();
+        corner = game.next_state(&corner, 0);
+        let (_, corner_hash) = game.canonical_symmetry_index(&corner);
+
+        // Edge opening (position 1)
+        let mut edge = game.initial_state();
+        edge = game.next_state(&edge, 1);
+        let (_, edge_hash) = game.canonical_symmetry_index(&edge);
+
+        // Center opening (position 4)
+        let mut center = game.initial_state();
+        center = game.next_state(&center, 4);
+        let (_, center_hash) = game.canonical_symmetry_index(&center);
+
+        // All three are truly distinct positions
+        assert_ne!(corner_hash, edge_hash, "Corner and edge should have different hashes");
+        assert_ne!(corner_hash, center_hash, "Corner and center should have different hashes");
+        assert_ne!(edge_hash, center_hash, "Edge and center should have different hashes");
     }
 }

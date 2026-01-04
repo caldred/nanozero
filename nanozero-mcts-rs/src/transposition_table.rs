@@ -207,4 +207,108 @@ mod tests {
         assert_eq!(tt.len(), 0);
         assert!(tt.is_empty());
     }
+
+    #[test]
+    fn test_hit_miss_stats() {
+        let mut tt = TranspositionTable::new();
+
+        // Initial stats
+        let (hits, misses, entries) = tt.stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 0);
+        assert_eq!(entries, 0);
+
+        // Miss
+        tt.get(100);
+        let (hits, misses, _) = tt.stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 1);
+
+        // Insert and hit
+        tt.get_or_insert(100);
+        tt.get(100);
+        let (hits, misses, entries) = tt.stats();
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
+        assert_eq!(entries, 1);
+
+        // Another hit
+        tt.get(100);
+        let (hits, _, _) = tt.stats();
+        assert_eq!(hits, 2);
+    }
+
+    #[test]
+    fn test_child_stats() {
+        let mut tt = TranspositionTable::new();
+        let entry = tt.get_or_insert(42);
+
+        // Add children
+        entry.children.push(ChildStats {
+            action: 0,
+            prior: 0.5,
+            visits: 10,
+            value_sum: 5.0,
+        });
+        entry.children.push(ChildStats {
+            action: 1,
+            prior: 0.3,
+            visits: 5,
+            value_sum: 2.0,
+        });
+        entry.children.push(ChildStats {
+            action: 2,
+            prior: 0.2,
+            visits: 3,
+            value_sum: 1.5,
+        });
+
+        assert!(entry.expanded());
+        assert_eq!(entry.children.len(), 3);
+
+        // Check priors sum to 1
+        let prior_sum: f32 = entry.children.iter().map(|c| c.prior).sum();
+        assert!((prior_sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_with_capacity() {
+        let tt = TranspositionTable::with_capacity(1000);
+        assert!(tt.is_empty());
+        assert_eq!(tt.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_entries() {
+        let mut tt = TranspositionTable::new();
+
+        // Insert multiple entries
+        for i in 0..100 {
+            let entry = tt.get_or_insert(i);
+            entry.visits = i as u32;
+            entry.value_sum = i as f32 * 0.5;
+        }
+
+        assert_eq!(tt.len(), 100);
+
+        // Verify they're all retrievable
+        for i in 0..100 {
+            let entry = tt.get(i).unwrap();
+            assert_eq!(entry.visits, i as u32);
+        }
+    }
+
+    #[test]
+    fn test_noise_added_flag() {
+        let mut tt = TranspositionTable::new();
+        let entry = tt.get_or_insert(123);
+
+        assert!(!entry.noise_added);
+        entry.noise_added = true;
+        assert!(entry.noise_added);
+
+        // Retrieve and verify
+        let entry = tt.get(123).unwrap();
+        assert!(entry.noise_added);
+    }
 }

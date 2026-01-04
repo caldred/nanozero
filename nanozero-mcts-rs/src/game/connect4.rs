@@ -371,4 +371,166 @@ mod tests {
         assert!((flipped_policy[0] - policy[6]).abs() < 1e-6);
         assert!((flipped_policy[3] - policy[3]).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_map_unmap_action_roundtrip() {
+        let game = Connect4::new();
+        // For all symmetries and actions, map then unmap should give identity
+        for sym_idx in 0..2 {
+            for action in 0..7u16 {
+                let mapped = game.map_action(action, sym_idx);
+                let unmapped = game.unmap_action(mapped, sym_idx);
+                assert_eq!(
+                    unmapped, action,
+                    "map_action/unmap_action roundtrip failed for sym={}, action={}",
+                    sym_idx, action
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_map_action_flip_is_self_inverse() {
+        let game = Connect4::new();
+        // Flip applied twice should give identity
+        for action in 0..7u16 {
+            let flipped_once = game.map_action(action, 1);
+            let flipped_twice = game.map_action(flipped_once, 1);
+            assert_eq!(flipped_twice, action, "Flip is not self-inverse for action={}", action);
+        }
+    }
+
+    #[test]
+    fn test_map_action_symmetry_consistency() {
+        let game = Connect4::new();
+        // Create a state with a piece at column 0
+        let mut state = game.initial_state();
+        state = game.next_state(&state, 0);
+
+        let policy = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let syms = game.symmetries(&state, &policy);
+
+        // For each symmetry, map_action(0) should point to where the policy mass moved
+        for (sym_idx, (sym_state, sym_policy)) in syms.iter().enumerate() {
+            let mapped_action = game.map_action(0, sym_idx);
+            // The symmetric policy should have 1.0 at mapped_action
+            assert!(
+                (sym_policy[mapped_action as usize] - 1.0).abs() < 1e-6,
+                "sym_idx={}: map_action(0)={} but policy has 1.0 at {:?}",
+                sym_idx,
+                mapped_action,
+                sym_policy
+                    .iter()
+                    .position(|&p| (p - 1.0).abs() < 1e-6)
+            );
+            // The symmetric state should have the piece in the mapped column
+            let s = sym_state.as_connect4();
+            assert_eq!(
+                s.get(5, mapped_action as usize), 1,
+                "sym_idx={}: piece not in column {}",
+                sym_idx, mapped_action
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_symmetry_index() {
+        use crate::game::compute_hash;
+
+        let game = Connect4::new();
+        // Create a state with a piece at left side
+        let mut state = game.initial_state();
+        state = game.next_state(&state, 0);
+
+        let (sym_idx, canonical_hash) = game.canonical_symmetry_index(&state);
+
+        // Verify this is the minimum hash among symmetries
+        let policy = vec![0.0f32; 7];
+        let syms = game.symmetries(&state, &policy);
+        for (idx, (sym_state, _)) in syms.iter().enumerate() {
+            let hash = compute_hash(sym_state);
+            if idx == sym_idx {
+                assert_eq!(hash, canonical_hash);
+            } else {
+                assert!(hash >= canonical_hash, "Found smaller hash at idx {}", idx);
+            }
+        }
+    }
+
+    #[test]
+    fn test_symmetric_states_same_canonical_hash() {
+        let game = Connect4::new();
+
+        // Opening in column 0 and column 6 are symmetric
+        let mut state0 = game.initial_state();
+        state0 = game.next_state(&state0, 0);
+        let (_, hash0) = game.canonical_symmetry_index(&state0);
+
+        let mut state6 = game.initial_state();
+        state6 = game.next_state(&state6, 6);
+        let (_, hash6) = game.canonical_symmetry_index(&state6);
+
+        assert_eq!(
+            hash0, hash6,
+            "Opening at column 0 and 6 should have same canonical hash"
+        );
+
+        // Similarly for columns 1 and 5, 2 and 4
+        for (col_a, col_b) in [(1, 5), (2, 4)] {
+            let mut sa = game.initial_state();
+            sa = game.next_state(&sa, col_a);
+            let (_, ha) = game.canonical_symmetry_index(&sa);
+
+            let mut sb = game.initial_state();
+            sb = game.next_state(&sb, col_b);
+            let (_, hb) = game.canonical_symmetry_index(&sb);
+
+            assert_eq!(
+                ha, hb,
+                "Opening at column {} and {} should have same canonical hash",
+                col_a, col_b
+            );
+        }
+    }
+
+    #[test]
+    fn test_center_column_self_symmetric() {
+        let game = Connect4::new();
+
+        // Opening at center column (3) should be self-symmetric
+        let mut state = game.initial_state();
+        state = game.next_state(&state, 3);
+
+        let syms = game.symmetries(&state, &vec![0.0f32; 7]);
+        let s0 = syms[0].0.as_connect4();
+        let s1 = syms[1].0.as_connect4();
+
+        // Both symmetries should produce the same board
+        assert_eq!(s0.board, s1.board, "Center opening should be self-symmetric");
+    }
+
+    #[test]
+    fn test_distinct_positions_different_hashes() {
+        let game = Connect4::new();
+
+        // Far left opening (column 0)
+        let mut left = game.initial_state();
+        left = game.next_state(&left, 0);
+        let (_, left_hash) = game.canonical_symmetry_index(&left);
+
+        // Center-left opening (column 2)
+        let mut center_left = game.initial_state();
+        center_left = game.next_state(&center_left, 2);
+        let (_, center_left_hash) = game.canonical_symmetry_index(&center_left);
+
+        // Center opening (column 3)
+        let mut center = game.initial_state();
+        center = game.next_state(&center, 3);
+        let (_, center_hash) = game.canonical_symmetry_index(&center);
+
+        // All three are truly distinct positions
+        assert_ne!(left_hash, center_left_hash, "Left and center-left should have different hashes");
+        assert_ne!(left_hash, center_hash, "Left and center should have different hashes");
+        assert_ne!(center_left_hash, center_hash, "Center-left and center should have different hashes");
+    }
 }
