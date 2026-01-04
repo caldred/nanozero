@@ -843,10 +843,12 @@ def sample_action(probs: np.ndarray, temperature: float = 1.0) -> int:
 # Try to import Rust MCTS backend
 try:
     from nanozero_mcts_rs import RustBatchedMCTS as _RustBatchedMCTS
+    from nanozero_mcts_rs import RustBayesianMCTS as _RustBayesianMCTS
     HAS_RUST_MCTS = True
 except ImportError:
     HAS_RUST_MCTS = False
     _RustBatchedMCTS = None
+    _RustBayesianMCTS = None
 
 
 class RustBatchedMCTS:
@@ -971,3 +973,189 @@ class RustBatchedMCTS:
         values = pred_values.cpu().numpy().flatten().astype(np.float32)
 
         return policies, values
+
+
+class RustBayesianMCTS:
+    """
+    Bayesian MCTS using Rust backend for tree operations.
+
+    Drop-in replacement for BayesianMCTS that runs the entire search in Rust,
+    only calling back to Python for neural network inference. Uses Gaussian
+    beliefs and Top-Two Thompson Sampling with IDS allocation.
+    """
+
+    def __init__(self, game: Game, config, leaves_per_batch: int = 0,
+                 use_transposition_table: bool = True, seed: Optional[int] = None):
+        """
+        Initialize Rust-backed Bayesian MCTS.
+
+        Args:
+            game: Game instance
+            config: BayesianMCTSConfig configuration
+            leaves_per_batch: Number of leaves to collect per NN call (0 = auto)
+            use_transposition_table: Whether to cache NN evaluations (not used in Rust)
+            seed: Random seed for reproducibility
+        """
+        if not HAS_RUST_MCTS:
+            raise ImportError("Rust MCTS backend not available. Install with: "
+                            "cd nanozero-mcts-rs && maturin develop --release")
+
+        self.game = game
+        self.config = config
+        self._model = None
+        self._device = None
+
+        # Create Rust Bayesian MCTS instance
+        self._rust_mcts = _RustBayesianMCTS(
+            num_simulations=config.num_simulations,
+            sigma_0=config.sigma_0,
+            obs_var=config.obs_var,
+            ids_alpha=config.ids_alpha,
+            prune_threshold=config.prune_threshold,
+            early_stopping=config.early_stopping,
+            confidence_threshold=config.confidence_threshold,
+            min_simulations=config.min_simulations,
+            min_variance=config.min_variance,
+            leaves_per_batch=leaves_per_batch,
+            seed=seed,
+        )
+
+        # Determine which game-specific search method to use
+        game_name = type(game).__name__.lower()
+        if 'tictactoe' in game_name:
+            self._search_fn = self._rust_mcts.search_tictactoe
+        elif 'connect4' in game_name:
+            self._search_fn = self._rust_mcts.search_connect4
+        else:
+            raise ValueError(f"Rust Bayesian MCTS does not support game: {game_name}")
+
+    def clear_cache(self):
+        """Clear any cached state. No-op for Rust MCTS."""
+        pass
+
+    def search(
+        self,
+        states: np.ndarray,
+        model: torch.nn.Module,
+        num_simulations: Optional[int] = None
+    ) -> np.ndarray:
+        """
+        Run Bayesian MCTS on multiple states using Rust backend.
+
+        The entire search runs in Rust, only calling back to Python for
+        neural network inference. Uses Thompson sampling for exploration.
+
+        Args:
+            states: Batch of game states (shape is game-defined)
+            model: Neural network for policy/value prediction
+            num_simulations: Number of MCTS simulations per state
+
+        Returns:
+            Policy array of shape (B, action_size)
+        """
+        if num_simulations is None:
+            num_simulations = self.config.num_simulations
+
+        # Store model and device for callback
+        self._model = model
+        self._device = next(model.parameters()).device
+
+        # Flatten states for Rust: (batch, h, w) -> (batch, h*w)
+        batch_size = states.shape[0]
+        flat_states = states.reshape(batch_size, -1)
+        flat_states = np.ascontiguousarray(flat_states, dtype=np.int8)
+
+        # Run search in Rust with callback to Python for NN inference
+        policies = self._search_fn(
+            flat_states,
+            self._nn_callback,
+            num_simulations=num_simulations
+        )
+
+        return np.array(policies)
+
+    def _nn_callback(self, states: np.ndarray, legal_masks: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Callback for Rust MCTS to get neural network predictions.
+
+        Args:
+            states: Batch of state tensors (already canonical, mapped to 0,1,2)
+            legal_masks: Batch of legal action masks
+
+        Returns:
+            Tuple of (policies, values) as numpy arrays
+        """
+        # Convert to torch tensors
+        state_tensors = torch.from_numpy(states).long().to(self._device)
+        action_masks = torch.from_numpy(legal_masks).float().to(self._device)
+
+        # Get predictions
+        with torch.inference_mode():
+            pred_policies, pred_values = self._model.predict(state_tensors, action_masks)
+
+        policies = pred_policies.cpu().numpy().astype(np.float32)
+        values = pred_values.cpu().numpy().flatten().astype(np.float32)
+
+        return policies, values
+
+
+# ============================================================================
+# Factory Functions (use Rust by default when available)
+# ============================================================================
+
+def get_batched_mcts(game: Game, config: MCTSConfig, use_rust: bool = True, **kwargs):
+    """
+    Get a BatchedMCTS instance, using Rust backend by default if available.
+
+    Args:
+        game: Game instance
+        config: MCTS configuration
+        use_rust: Whether to prefer Rust implementation (default True)
+        **kwargs: Additional arguments passed to constructor
+
+    Returns:
+        BatchedMCTS or RustBatchedMCTS instance
+    """
+    if use_rust and HAS_RUST_MCTS:
+        game_name = type(game).__name__.lower()
+        if 'tictactoe' in game_name or 'connect4' in game_name:
+            mcts = RustBatchedMCTS(game, config, **kwargs)
+            mcts.backend = 'rust'
+            return mcts
+
+    # Fall back to Python implementation
+    mcts = BatchedMCTS(game, config, **kwargs)
+    mcts.backend = 'python'
+    return mcts
+
+
+def get_bayesian_mcts(game: Game, config, use_rust: bool = True, **kwargs):
+    """
+    Get a BayesianMCTS instance, using Rust backend by default if available.
+
+    Args:
+        game: Game instance
+        config: BayesianMCTSConfig configuration
+        use_rust: Whether to prefer Rust implementation (default True)
+        **kwargs: Additional arguments passed to constructor
+
+    Returns:
+        BayesianMCTS or RustBayesianMCTS instance
+    """
+    if use_rust and HAS_RUST_MCTS:
+        game_name = type(game).__name__.lower()
+        if 'tictactoe' in game_name or 'connect4' in game_name:
+            mcts = RustBayesianMCTS(game, config, **kwargs)
+            mcts.backend = 'rust'
+            return mcts
+
+    # Fall back to Python implementation
+    from nanozero.bayesian_mcts import BayesianMCTS
+    mcts = BayesianMCTS(game, config, **kwargs)
+    mcts.backend = 'python'
+    return mcts
+
+
+def is_rust_mcts_available() -> bool:
+    """Check if the Rust MCTS backend is available."""
+    return HAS_RUST_MCTS

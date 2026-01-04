@@ -3,13 +3,18 @@
 //! Exposes Rust MCTS that runs the full search loop internally,
 //! only calling back to Python for neural network inference.
 
+use crate::bayesian_node::create_bayesian_children;
+use crate::bayesian_search::{
+    bayesian_backup, get_bayesian_policy, select_child_thompson_ids, should_stop_early,
+    BayesianSearchPath, BayesianTreeArena,
+};
 use crate::game::{Game, GameState};
+use crate::math::add_dirichlet_noise;
 use crate::search::{
     apply_virtual_loss, backup_with_virtual_loss_removal, select_child_with_virtual_loss,
     SearchPath,
 };
 use crate::tree::TreeArena;
-use crate::math::add_dirichlet_noise;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -439,6 +444,445 @@ impl PyBatchedMCTS {
     }
 }
 
+// ============================================================================
+// Bayesian MCTS (TTTS) Python Bindings
+// ============================================================================
+
+/// Python wrapper for Bayesian MCTS with Thompson Sampling.
+///
+/// Uses Gaussian beliefs instead of visit counts, and Top-Two Thompson
+/// Sampling with IDS allocation for selection. Optimizes for best arm
+/// identification rather than cumulative regret.
+#[pyclass(name = "RustBayesianMCTS")]
+pub struct PyBayesianMCTS {
+    /// Number of simulations per search
+    num_simulations: u32,
+    /// Prior std for logit-shifted initialization
+    sigma_0: f32,
+    /// Observation variance (NN value uncertainty)
+    obs_var: f32,
+    /// IDS pseudocount
+    ids_alpha: f32,
+    /// Soft-prune threshold for aggregation
+    prune_threshold: f32,
+    /// Whether to stop early when confident
+    early_stopping: bool,
+    /// P(leader is optimal) threshold for early stopping
+    confidence_threshold: f32,
+    /// Minimum simulations before early stopping
+    min_simulations: u32,
+    /// Floor for variance (numerical stability)
+    min_variance: f32,
+    /// Number of leaves to collect per NN call
+    leaves_per_batch: u32,
+    /// Random number generator
+    rng: rand::rngs::StdRng,
+}
+
+#[pymethods]
+impl PyBayesianMCTS {
+    /// Create a new Bayesian MCTS instance.
+    ///
+    /// Args:
+    ///     num_simulations: Number of simulations per search (default 1000)
+    ///     sigma_0: Prior std for logit-shifted init (default 1.0)
+    ///     obs_var: Observation variance (default 1.0)
+    ///     ids_alpha: IDS pseudocount (default 0.0)
+    ///     prune_threshold: Soft-prune threshold (default 0.01)
+    ///     early_stopping: Whether to stop early (default True)
+    ///     confidence_threshold: P(optimal) threshold for stopping (default 0.95)
+    ///     min_simulations: Min sims before early stopping (default 10)
+    ///     min_variance: Variance floor (default 1e-6)
+    ///     leaves_per_batch: Leaves per NN call, 0 = auto (default 0)
+    ///     seed: Random seed (optional)
+    #[new]
+    #[pyo3(signature = (
+        num_simulations=1000,
+        sigma_0=1.0,
+        obs_var=1.0,
+        ids_alpha=0.0,
+        prune_threshold=0.01,
+        early_stopping=true,
+        confidence_threshold=0.95,
+        min_simulations=10,
+        min_variance=1e-6,
+        leaves_per_batch=0,
+        seed=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        num_simulations: u32,
+        sigma_0: f32,
+        obs_var: f32,
+        ids_alpha: f32,
+        prune_threshold: f32,
+        early_stopping: bool,
+        confidence_threshold: f32,
+        min_simulations: u32,
+        min_variance: f32,
+        leaves_per_batch: u32,
+        seed: Option<u64>,
+    ) -> Self {
+        let rng = match seed {
+            Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+            None => rand::rngs::StdRng::from_entropy(),
+        };
+
+        Self {
+            num_simulations,
+            sigma_0,
+            obs_var,
+            ids_alpha,
+            prune_threshold,
+            early_stopping,
+            confidence_threshold,
+            min_simulations,
+            min_variance,
+            leaves_per_batch,
+            rng,
+        }
+    }
+
+    /// Run Bayesian MCTS on a batch of TicTacToe states.
+    #[pyo3(signature = (states, nn_callback, num_simulations=None))]
+    fn search_tictactoe<'py>(
+        &mut self,
+        py: Python<'py>,
+        states: PyReadonlyArray2<i8>,
+        nn_callback: PyObject,
+        num_simulations: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let num_sims = num_simulations.unwrap_or(self.num_simulations);
+        let game = crate::game::TicTacToe::new();
+        self.search_internal(py, states, nn_callback, num_sims, &game)
+    }
+
+    /// Run Bayesian MCTS on a batch of Connect4 states.
+    #[pyo3(signature = (states, nn_callback, num_simulations=None))]
+    fn search_connect4<'py>(
+        &mut self,
+        py: Python<'py>,
+        states: PyReadonlyArray2<i8>,
+        nn_callback: PyObject,
+        num_simulations: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let num_sims = num_simulations.unwrap_or(self.num_simulations);
+        let game = crate::game::Connect4::new();
+        self.search_internal(py, states, nn_callback, num_sims, &game)
+    }
+}
+
+impl PyBayesianMCTS {
+    /// Internal search implementation generic over game type.
+    fn search_internal<'py, G: Game>(
+        &mut self,
+        py: Python<'py>,
+        states: PyReadonlyArray2<i8>,
+        nn_callback: PyObject,
+        num_simulations: u32,
+        game: &G,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let states_arr = states.as_array();
+        let num_states = states_arr.nrows();
+        let action_size = game.action_size();
+
+        // Convert input states to GameStates
+        let mut game_states: Vec<GameState> = Vec::with_capacity(num_states);
+        for i in 0..num_states {
+            let row = states_arr.row(i);
+            let state = game.state_from_slice(row.as_slice().unwrap());
+            game_states.push(state);
+        }
+
+        // Initialize Bayesian search trees
+        let mut arenas: Vec<BayesianTreeArena> = Vec::with_capacity(num_states);
+        for _ in 0..num_states {
+            let mut arena = BayesianTreeArena::new(1024);
+            arena.new_root();
+            arenas.push(arena);
+        }
+
+        // Expand roots with NN
+        let (root_policies, root_values) =
+            self.call_nn(py, &nn_callback, &game_states, game)?;
+
+        for (state_idx, arena) in arenas.iter_mut().enumerate() {
+            let state = &game_states[state_idx];
+            let policy = &root_policies[state_idx];
+            let value = root_values[state_idx];
+
+            // Get legal actions and priors
+            let legal_actions = game.legal_actions(state);
+            let mut actions: Vec<u16> = Vec::new();
+            let mut priors: Vec<f32> = Vec::new();
+
+            for action in legal_actions {
+                actions.push(action);
+                priors.push(policy[action as usize]);
+            }
+
+            // Renormalize priors
+            let sum: f32 = priors.iter().sum();
+            if sum > 0.0 {
+                for p in priors.iter_mut() {
+                    *p /= sum;
+                }
+            }
+
+            // Create children with logit-shifted initialization
+            let children_params = create_bayesian_children(value, &priors, self.sigma_0);
+            arena.add_children(0, &actions, &children_params);
+
+            // Initialize aggregated belief at root
+            arena.update_aggregated(0, self.prune_threshold, false);
+        }
+
+        // Track which root states are terminal
+        let root_terminal: Vec<bool> = game_states
+            .iter()
+            .map(|s| game.is_terminal(s))
+            .collect();
+
+        // Track which states are still active (not stopped early)
+        let mut active_mask: Vec<bool> = vec![true; num_states];
+
+        // Determine leaves per batch
+        let leaves_per_batch = if self.leaves_per_batch > 0 {
+            self.leaves_per_batch as usize
+        } else {
+            num_states * 8
+        };
+
+        // Run simulations
+        let mut sims_completed = 0u32;
+        while sims_completed < num_simulations {
+            // Collect leaves with virtual loss batching
+            let mut leaves_to_expand: Vec<(usize, BayesianSearchPath, GameState)> = Vec::new();
+            let mut terminal_backups: Vec<(usize, BayesianSearchPath, f32)> = Vec::new();
+
+            // Collect leaves from all active, non-terminal states
+            let mut attempts = 0;
+            let max_attempts = leaves_per_batch * 2;
+
+            while leaves_to_expand.len() < leaves_per_batch
+                && attempts < max_attempts
+                && (sims_completed + leaves_to_expand.len() as u32 + terminal_backups.len() as u32)
+                    < num_simulations
+            {
+                for state_idx in 0..num_states {
+                    if root_terminal[state_idx] || !active_mask[state_idx] {
+                        continue;
+                    }
+
+                    if leaves_to_expand.len() >= leaves_per_batch {
+                        break;
+                    }
+
+                    let arena = &arenas[state_idx];
+                    let root_idx = 0u32;
+                    let mut path = BayesianSearchPath::from_root(root_idx);
+                    let mut node_idx = root_idx;
+                    let mut current_state = game_states[state_idx].clone();
+
+                    // SELECT: traverse tree using Thompson sampling
+                    loop {
+                        // Check if current state is terminal
+                        if game.is_terminal(&current_state) {
+                            let value = game.terminal_reward(&current_state);
+                            terminal_backups.push((state_idx, path.clone(), value));
+                            break;
+                        }
+
+                        let node = arena.get(node_idx);
+
+                        // Check if needs expansion
+                        if !node.expanded() {
+                            leaves_to_expand.push((state_idx, path, current_state));
+                            break;
+                        }
+
+                        // Select using Thompson sampling with IDS
+                        let (action, child_idx) = select_child_thompson_ids(
+                            arena,
+                            node_idx,
+                            self.ids_alpha,
+                            &mut self.rng,
+                        );
+                        path.push(action, child_idx);
+                        node_idx = child_idx;
+
+                        // Apply action to state
+                        current_state = game.next_state(&current_state, action);
+                    }
+                }
+                attempts += 1;
+            }
+
+            // Backup terminal leaves immediately
+            for (state_idx, path, value) in terminal_backups.drain(..) {
+                bayesian_backup(
+                    &mut arenas[state_idx],
+                    &path,
+                    value,
+                    self.obs_var,
+                    self.min_variance,
+                    self.prune_threshold,
+                    0.0,   // optimality_weight (unused)
+                    false, // adaptive (unused)
+                    0.0,   // visit_scale (unused)
+                );
+                sims_completed += 1;
+            }
+
+            // Expand non-terminal leaves with batched NN call
+            if !leaves_to_expand.is_empty() {
+                let leaf_states: Vec<GameState> = leaves_to_expand
+                    .iter()
+                    .map(|(_, _, s)| s.clone())
+                    .collect();
+
+                let (policies, values) = self.call_nn(py, &nn_callback, &leaf_states, game)?;
+
+                for (i, (state_idx, path, leaf_state)) in leaves_to_expand.iter().enumerate() {
+                    let arena = &mut arenas[*state_idx];
+                    let leaf_idx = path.leaf();
+                    let policy = &policies[i];
+                    let value = values[i];
+
+                    // Get legal actions and priors
+                    let legal_actions = game.legal_actions(leaf_state);
+                    let mut actions: Vec<u16> = Vec::new();
+                    let mut priors: Vec<f32> = Vec::new();
+
+                    for action in legal_actions {
+                        actions.push(action);
+                        priors.push(policy[action as usize]);
+                    }
+
+                    // Renormalize
+                    let sum: f32 = priors.iter().sum();
+                    if sum > 0.0 {
+                        for p in priors.iter_mut() {
+                            *p /= sum;
+                        }
+                    }
+
+                    // Create children with logit-shifted initialization
+                    let children_params = create_bayesian_children(value, &priors, self.sigma_0);
+                    arena.add_children(leaf_idx, &actions, &children_params);
+
+                    // Initialize aggregated belief for the expanded node
+                    arena.update_aggregated(leaf_idx, self.prune_threshold, false);
+
+                    // Backup
+                    bayesian_backup(
+                        arena,
+                        path,
+                        value,
+                        self.obs_var,
+                        self.min_variance,
+                        self.prune_threshold,
+                        0.0,
+                        false,
+                        0.0,
+                    );
+                    sims_completed += 1;
+                }
+            }
+
+            // Early stopping check
+            if self.early_stopping && sims_completed >= self.min_simulations {
+                for state_idx in 0..num_states {
+                    if active_mask[state_idx]
+                        && !root_terminal[state_idx]
+                        && should_stop_early(&arenas[state_idx], 0, self.confidence_threshold)
+                    {
+                        active_mask[state_idx] = false;
+                    }
+                }
+
+                // If all states stopped early, exit loop
+                if !active_mask.iter().any(|&a| a) {
+                    break;
+                }
+            }
+
+            // Safety: if nothing was collected, break
+            if leaves_to_expand.is_empty() && terminal_backups.is_empty() {
+                break;
+            }
+        }
+
+        // Extract policies from optimality weights
+        let mut result = vec![0.0f32; num_states * action_size];
+        for (state_idx, arena) in arenas.iter().enumerate() {
+            let policy = get_bayesian_policy(arena, 0, action_size);
+            for (a, &p) in policy.iter().enumerate() {
+                result[state_idx * action_size + a] = p;
+            }
+        }
+
+        Ok(PyArray1::from_vec_bound(py, result)
+            .reshape([num_states, action_size])
+            .unwrap())
+    }
+
+    /// Call the Python NN callback with batched states.
+    fn call_nn<G: Game>(
+        &self,
+        py: Python<'_>,
+        nn_callback: &PyObject,
+        states: &[GameState],
+        game: &G,
+    ) -> PyResult<(Vec<Vec<f32>>, Vec<f32>)> {
+        let batch_size = states.len();
+        let action_size = game.action_size();
+
+        // Prepare canonical states as i64 tensors
+        let mut state_data: Vec<i64> = Vec::with_capacity(batch_size * game.board_size());
+        for state in states {
+            let canonical = game.canonical_state(state);
+            let tensor = game.to_tensor(&canonical);
+            state_data.extend(tensor);
+        }
+
+        // Prepare legal action masks
+        let mut mask_data: Vec<bool> = Vec::with_capacity(batch_size * action_size);
+        for state in states {
+            let mask = game.legal_actions_mask(state);
+            mask_data.extend(mask);
+        }
+
+        // Create numpy arrays
+        let states_array = PyArray1::from_vec_bound(py, state_data)
+            .reshape([batch_size, game.board_size()])
+            .unwrap();
+        let masks_array = PyArray1::from_vec_bound(py, mask_data)
+            .reshape([batch_size, action_size])
+            .unwrap();
+
+        // Call Python callback
+        let result = nn_callback.call1(py, (states_array, masks_array))?;
+        let tuple = result.downcast_bound::<PyTuple>(py)?;
+
+        // Extract policies and values
+        let policies_arr: PyReadonlyArray2<f32> = tuple.get_item(0)?.extract()?;
+        let values_arr: PyReadonlyArray1<f32> = tuple.get_item(1)?.extract()?;
+
+        let policies_view = policies_arr.as_array();
+        let values_view = values_arr.as_array();
+
+        let mut policies: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            policies.push(policies_view.row(i).to_vec());
+        }
+
+        let values: Vec<f32> = values_view.to_vec();
+
+        Ok((policies, values))
+    }
+}
+
 // For backwards compatibility - keep the old simpler structs
 /// Information about a leaf that needs expansion, returned to Python.
 #[pyclass]
@@ -465,8 +909,27 @@ mod tests {
 
     #[test]
     fn test_py_batched_mcts_creation() {
-        let mcts = PyBatchedMCTS::new(1.0, 0.3, 0.25, 100, Some(42));
+        let mcts = PyBatchedMCTS::new(1.0, 0.3, 0.25, 100, 0, 1.0, Some(42));
         assert_eq!(mcts.c_puct, 1.0);
         assert_eq!(mcts.num_simulations, 100);
+    }
+
+    #[test]
+    fn test_py_bayesian_mcts_creation() {
+        let mcts = PyBayesianMCTS::new(
+            1000,  // num_simulations
+            1.0,   // sigma_0
+            1.0,   // obs_var
+            0.0,   // ids_alpha
+            0.01,  // prune_threshold
+            true,  // early_stopping
+            0.95,  // confidence_threshold
+            10,    // min_simulations
+            1e-6,  // min_variance
+            0,     // leaves_per_batch
+            Some(42),
+        );
+        assert_eq!(mcts.num_simulations, 1000);
+        assert_eq!(mcts.sigma_0, 1.0);
     }
 }

@@ -283,9 +283,11 @@ mod tests {
             assert!((sigma_sq - 1.0).abs() < 1e-6);
         }
 
-        // Higher prior should have higher initial mean
-        // (because log(higher_prior) is less negative)
-        assert!(children[0].1 > children[2].1);
+        // Higher prior should have LOWER initial mean (from child's perspective)
+        // because: mu = -value - scale * (log_prior + entropy)
+        // Higher prior → less negative log → larger (log_prior + entropy) → more subtracted → lower mu
+        // This means good moves (high prior) lead to positions worse for opponent (lower child mu)
+        assert!(children[0].1 < children[2].1);
     }
 
     #[test]

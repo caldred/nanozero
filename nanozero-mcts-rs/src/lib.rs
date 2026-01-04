@@ -412,6 +412,7 @@ fn nanozero_mcts_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // MCTS
     m.add_class::<py_mcts::PyBatchedMCTS>()?;
+    m.add_class::<py_mcts::PyBayesianMCTS>()?;
     m.add_class::<py_mcts::PyLeafInfo>()?;
     m.add_class::<py_mcts::PySelectResult>()?;
 

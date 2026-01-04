@@ -49,13 +49,15 @@ pub fn ucb_score_with_virtual_loss(
     let effective_child_visits = child_visit_count + child_virtual_loss as u32;
 
     // Adjust child value for virtual loss
-    // Virtual loss is treated as a loss (-virtual_loss_value) for each virtual visit
+    // Virtual loss makes the child look like it's winning (bad for parent)
+    // to discourage re-selection of in-flight paths.
+    // From child's perspective: positive value = child winning = bad for parent
     let adjusted_value = if child_visit_count > 0 {
         let total_value =
-            child_value * child_visit_count as f32 - virtual_loss_value * child_virtual_loss as f32;
+            child_value * child_visit_count as f32 + virtual_loss_value * child_virtual_loss as f32;
         total_value / effective_child_visits as f32
     } else if child_virtual_loss > 0 {
-        -virtual_loss_value
+        virtual_loss_value  // Child "winning" discourages selection
     } else {
         0.0
     };
