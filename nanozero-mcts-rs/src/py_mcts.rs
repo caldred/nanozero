@@ -4,7 +4,10 @@
 //! only calling back to Python for neural network inference.
 
 use crate::game::{Game, GameState};
-use crate::search::{backup, select_child, SearchPath};
+use crate::search::{
+    apply_virtual_loss, backup_with_virtual_loss_removal, select_child_with_virtual_loss,
+    SearchPath,
+};
 use crate::tree::TreeArena;
 use crate::math::add_dirichlet_noise;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
@@ -27,6 +30,10 @@ pub struct PyBatchedMCTS {
     dirichlet_epsilon: f32,
     /// Number of simulations per search
     num_simulations: u32,
+    /// Number of leaves to collect per NN call (virtual loss batching)
+    leaves_per_batch: u32,
+    /// Virtual loss value (how much to penalize in-flight paths)
+    virtual_loss_value: f32,
     /// Random number generator
     rng: rand::rngs::StdRng,
 }
@@ -40,14 +47,18 @@ impl PyBatchedMCTS {
     ///     dirichlet_alpha: Dirichlet noise alpha (default 0.3)
     ///     dirichlet_epsilon: Dirichlet noise mixing weight (default 0.25)
     ///     num_simulations: Number of simulations per search (default 100)
+    ///     leaves_per_batch: Number of leaves to collect per NN call (default 0 = auto)
+    ///     virtual_loss_value: Virtual loss penalty value (default 1.0)
     ///     seed: Random seed (optional)
     #[new]
-    #[pyo3(signature = (c_puct=1.0, dirichlet_alpha=0.3, dirichlet_epsilon=0.25, num_simulations=100, seed=None))]
+    #[pyo3(signature = (c_puct=1.0, dirichlet_alpha=0.3, dirichlet_epsilon=0.25, num_simulations=100, leaves_per_batch=0, virtual_loss_value=1.0, seed=None))]
     fn new(
         c_puct: f32,
         dirichlet_alpha: f32,
         dirichlet_epsilon: f32,
         num_simulations: u32,
+        leaves_per_batch: u32,
+        virtual_loss_value: f32,
         seed: Option<u64>,
     ) -> Self {
         let rng = match seed {
@@ -60,6 +71,8 @@ impl PyBatchedMCTS {
             dirichlet_alpha,
             dirichlet_epsilon,
             num_simulations,
+            leaves_per_batch,
+            virtual_loss_value,
             rng,
         }
     }
@@ -209,52 +222,92 @@ impl PyBatchedMCTS {
             .map(|s| game.is_terminal(s))
             .collect();
 
-        // Run simulations
-        for _sim in 0..num_simulations {
-            // Select leaves from all non-terminal states
+        // Determine leaves per batch:
+        // - If user specified > 0, use that
+        // - Otherwise, use num_states (one leaf per game per batch)
+        let leaves_per_batch = if self.leaves_per_batch > 0 {
+            self.leaves_per_batch as usize
+        } else {
+            num_states
+        };
+
+        // Run simulations with virtual loss batching
+        let mut sims_completed = 0u32;
+        while sims_completed < num_simulations {
+            // Collect leaves with virtual loss until we have enough or run out
             let mut leaves_to_expand: Vec<(usize, SearchPath, GameState)> = Vec::new();
             let mut terminal_backups: Vec<(usize, SearchPath, f32)> = Vec::new();
 
-            for (state_idx, arena) in arenas.iter().enumerate() {
-                if root_terminal[state_idx] {
-                    continue;
-                }
+            // Track how many leaves we've collected from each game tree
+            let mut game_leaf_counts: Vec<u32> = vec![0; num_states];
 
-                let root_idx = 0u32;
-                let mut path = SearchPath::from_root(root_idx);
-                let mut node_idx = root_idx;
-                let mut current_state = game_states[state_idx].clone();
+            // Collect leaves across all games, cycling through them
+            let mut attempts = 0;
+            let max_attempts = leaves_per_batch * 2; // Prevent infinite loop
 
-                // SELECT: traverse tree
-                loop {
-                    // Check if current state is terminal
-                    if game.is_terminal(&current_state) {
-                        let value = game.terminal_reward(&current_state);
-                        terminal_backups.push((state_idx, path, value));
+            while leaves_to_expand.len() < leaves_per_batch
+                && attempts < max_attempts
+                && (sims_completed + leaves_to_expand.len() as u32 + terminal_backups.len() as u32)
+                    < num_simulations
+            {
+                for state_idx in 0..num_states {
+                    if root_terminal[state_idx] {
+                        continue;
+                    }
+
+                    if leaves_to_expand.len() >= leaves_per_batch {
                         break;
                     }
 
-                    let node = arena.get(node_idx);
+                    let arena = &mut arenas[state_idx];
+                    let root_idx = 0u32;
+                    let mut path = SearchPath::from_root(root_idx);
+                    let mut node_idx = root_idx;
+                    let mut current_state = game_states[state_idx].clone();
 
-                    // Check if needs expansion
-                    if !node.expanded() {
-                        leaves_to_expand.push((state_idx, path, current_state));
-                        break;
+                    // SELECT: traverse tree using virtual loss
+                    loop {
+                        // Check if current state is terminal
+                        if game.is_terminal(&current_state) {
+                            let value = game.terminal_reward(&current_state);
+                            terminal_backups.push((state_idx, path.clone(), value));
+                            break;
+                        }
+
+                        let node = arena.get(node_idx);
+
+                        // Check if needs expansion
+                        if !node.expanded() {
+                            // Apply virtual loss to this path
+                            apply_virtual_loss(arena, &path);
+                            leaves_to_expand.push((state_idx, path, current_state));
+                            game_leaf_counts[state_idx] += 1;
+                            break;
+                        }
+
+                        // Select best child using virtual loss
+                        let (action, child_idx) = select_child_with_virtual_loss(
+                            arena,
+                            node_idx,
+                            self.c_puct,
+                            self.virtual_loss_value,
+                        );
+                        path.push(action, child_idx);
+                        node_idx = child_idx;
+
+                        // Apply action to state
+                        current_state = game.next_state(&current_state, action);
                     }
-
-                    // Select best child
-                    let (action, child_idx) = select_child(arena, node_idx, self.c_puct);
-                    path.push(action, child_idx);
-                    node_idx = child_idx;
-
-                    // Apply action to state
-                    current_state = game.next_state(&current_state, action);
                 }
+                attempts += 1;
             }
 
-            // Backup terminal leaves
-            for (state_idx, path, value) in terminal_backups {
+            // Backup terminal leaves immediately (no NN needed)
+            for (state_idx, path, value) in terminal_backups.drain(..) {
+                // Terminal paths don't have virtual loss applied, so use regular backup
+                use crate::search::backup;
                 backup(&mut arenas[state_idx], &path, value);
+                sims_completed += 1;
             }
 
             // Expand non-terminal leaves with batched NN call
@@ -292,9 +345,15 @@ impl PyBatchedMCTS {
 
                     arena.add_children(leaf_idx, &actions, &priors);
 
-                    // Backup value
-                    backup(arena, path, value);
+                    // Backup value and remove virtual loss
+                    backup_with_virtual_loss_removal(arena, path, value);
+                    sims_completed += 1;
                 }
+            }
+
+            // Safety: if nothing was collected, break to avoid infinite loop
+            if leaves_to_expand.is_empty() && terminal_backups.is_empty() {
+                break;
             }
         }
 

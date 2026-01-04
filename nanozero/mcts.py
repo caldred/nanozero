@@ -859,14 +859,15 @@ class RustBatchedMCTS:
     """
 
     def __init__(self, game: Game, config: MCTSConfig, virtual_loss: float = 1.0,
-                 use_transposition_table: bool = True):
+                 leaves_per_batch: int = 0, use_transposition_table: bool = True):
         """
         Initialize Rust-backed batched MCTS.
 
         Args:
             game: Game instance
             config: MCTS configuration
-            virtual_loss: Virtual loss value (not used in current Rust impl)
+            virtual_loss: Virtual loss value for penalizing in-flight paths
+            leaves_per_batch: Number of leaves to collect per NN call (0 = auto = batch_size)
             use_transposition_table: Whether to cache NN evaluations (not used in Rust impl)
         """
         if not HAS_RUST_MCTS:
@@ -878,12 +879,14 @@ class RustBatchedMCTS:
         self._model = None
         self._device = None
 
-        # Create Rust MCTS instance
+        # Create Rust MCTS instance with virtual loss batching
         self._rust_mcts = _RustBatchedMCTS(
             c_puct=config.c_puct,
             dirichlet_alpha=config.dirichlet_alpha,
             dirichlet_epsilon=config.dirichlet_epsilon,
             num_simulations=config.num_simulations,
+            leaves_per_batch=leaves_per_batch,
+            virtual_loss_value=virtual_loss,
         )
 
         # Determine which game-specific search method to use

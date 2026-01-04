@@ -248,9 +248,9 @@ pub fn bayesian_backup(
     obs_var: f32,
     min_variance: f32,
     prune_threshold: f32,
-    optimality_weight: f32,
-    adaptive: bool,
-    visit_scale: f32,
+    _optimality_weight: f32,
+    _adaptive: bool,
+    _visit_scale: f32,
 ) {
     if path.nodes.len() < 2 {
         return; // No backup needed for root-only path
@@ -288,9 +288,6 @@ pub fn bayesian_backup(
             parent_idx,
             prune_threshold,
             true,
-            optimality_weight,
-            adaptive,
-            visit_scale,
         );
 
         // Copy aggregated belief to own belief (no Bayesian update!)

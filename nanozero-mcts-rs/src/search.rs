@@ -102,6 +102,54 @@ pub fn select_child(arena: &TreeArena, node_idx: u32, c_puct: f32) -> (u16, u32)
     (best_action, best_child_idx)
 }
 
+/// Select the best child according to UCB score with virtual loss.
+///
+/// Uses effective visit counts that include virtual loss to discourage
+/// selecting the same path multiple times before backup.
+///
+/// Returns (action, child_node_idx) of the best child.
+pub fn select_child_with_virtual_loss(
+    arena: &TreeArena,
+    node_idx: u32,
+    c_puct: f32,
+    virtual_loss_value: f32,
+) -> (u16, u32) {
+    use crate::ucb::ucb_score_with_virtual_loss;
+
+    let parent = arena.get(node_idx);
+    let parent_visits = parent.visit_count;
+    let parent_vl = parent.virtual_loss;
+    let children = arena.get_children(node_idx);
+
+    debug_assert!(!children.is_empty(), "select_child called on unexpanded node");
+
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_action = 0u16;
+    let mut best_child_idx = 0u32;
+
+    for child_entry in children {
+        let child = arena.get(child_entry.node_idx);
+        let score = ucb_score_with_virtual_loss(
+            parent_visits,
+            parent_vl,
+            child.prior,
+            child.visit_count,
+            child.virtual_loss,
+            child.value(),
+            c_puct,
+            virtual_loss_value,
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_action = child_entry.action;
+            best_child_idx = child_entry.node_idx;
+        }
+    }
+
+    (best_action, best_child_idx)
+}
+
 /// Result of selecting to a leaf node.
 pub struct SelectResult {
     /// Path from root to leaf
