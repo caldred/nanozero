@@ -285,7 +285,6 @@ class TestBayesianMCTSGo:
     def config(self):
         return BayesianMCTSConfig(num_simulations=10)
 
-    @pytest.mark.skip(reason="Rust BayesianMCTS doesn't support Go yet (no search_go method)")
     def test_search_go(self, game, model, config):
         """BayesianMCTS works with Go."""
         mcts = BayesianMCTS(game, config)
@@ -297,6 +296,133 @@ class TestBayesianMCTSGo:
         assert abs(policy.sum() - 1.0) < 1e-6
         # All 81 positions + pass should be legal initially
         assert np.count_nonzero(policy) == 82
+
+
+class TestMCTSFactoryFunctions:
+    """Tests for MCTS factory functions."""
+
+    def test_get_batched_mcts(self):
+        """get_batched_mcts returns BatchedMCTS instance."""
+        from nanozero.mcts import get_batched_mcts, BatchedMCTS
+        from nanozero.config import MCTSConfig
+
+        game = get_game('tictactoe')
+        config = MCTSConfig(num_simulations=10)
+        mcts = get_batched_mcts(game, config)
+
+        assert isinstance(mcts, BatchedMCTS)
+        assert mcts.backend == 'rust'
+
+    def test_get_bayesian_mcts(self):
+        """get_bayesian_mcts returns BayesianMCTS instance."""
+        from nanozero.mcts import get_bayesian_mcts, BayesianMCTS
+
+        game = get_game('tictactoe')
+        config = BayesianMCTSConfig(num_simulations=10)
+        mcts = get_bayesian_mcts(game, config)
+
+        assert isinstance(mcts, BayesianMCTS)
+        assert mcts.backend == 'rust'
+
+    def test_use_rust_param_ignored(self):
+        """use_rust parameter is accepted but ignored."""
+        from nanozero.mcts import get_batched_mcts, get_bayesian_mcts
+        from nanozero.config import MCTSConfig
+
+        game = get_game('tictactoe')
+
+        mcts1 = get_batched_mcts(game, MCTSConfig(), use_rust=True)
+        mcts2 = get_batched_mcts(game, MCTSConfig(), use_rust=False)
+        assert mcts1.backend == 'rust'
+        assert mcts2.backend == 'rust'
+
+    def test_is_rust_mcts_available(self):
+        """is_rust_mcts_available returns True."""
+        from nanozero.mcts import is_rust_mcts_available
+        assert is_rust_mcts_available() == True
+
+
+class TestBatchedMCTS:
+    """Tests for BatchedMCTS class."""
+
+    @pytest.fixture
+    def game(self):
+        return get_game('tictactoe')
+
+    @pytest.fixture
+    def model(self, game):
+        model_config = get_model_config(game.config, n_layer=2)
+        model = AlphaZeroTransformer(model_config)
+        model.eval()
+        return model
+
+    @pytest.fixture
+    def config(self):
+        return MCTSConfig(num_simulations=20)
+
+    def test_initialization(self, game, config):
+        """BatchedMCTS initializes correctly."""
+        mcts = BatchedMCTS(game, config)
+        assert mcts.game == game
+        assert mcts.config == config
+        assert mcts.backend == 'rust'
+
+    def test_search_returns_valid_policy(self, game, config, model):
+        """Search returns normalized policy."""
+        mcts = BatchedMCTS(game, config)
+        state = game.initial_state()
+        states = state[np.newaxis, ...]
+
+        policy = mcts.search(states, model, add_noise=False)[0]
+
+        assert abs(policy.sum() - 1.0) < 1e-6
+        assert all(policy >= 0)
+
+    def test_search_with_noise(self, game, config, model):
+        """Search with noise still produces valid policy."""
+        mcts = BatchedMCTS(game, config)
+        state = game.initial_state()
+        states = state[np.newaxis, ...]
+
+        policy = mcts.search(states, model, add_noise=True)[0]
+
+        assert abs(policy.sum() - 1.0) < 1e-6
+
+    def test_search_batch(self, game, config, model):
+        """Search handles batches correctly."""
+        mcts = BatchedMCTS(game, config)
+        states = np.stack([game.initial_state() for _ in range(4)])
+
+        policies = mcts.search(states, model, add_noise=False)
+
+        assert policies.shape == (4, game.config.action_size)
+
+    def test_clear_cache(self, game, config):
+        """clear_cache doesn't raise."""
+        mcts = BatchedMCTS(game, config)
+        mcts.clear_cache()  # Should not raise
+
+
+class TestBatchedMCTSConnect4:
+    """Tests for BatchedMCTS with Connect4."""
+
+    def test_search_connect4(self):
+        """BatchedMCTS works with Connect4."""
+        game = get_game('connect4')
+        model_config = get_model_config(game.config, n_layer=2)
+        model = AlphaZeroTransformer(model_config)
+        model.eval()
+
+        config = MCTSConfig(num_simulations=10)
+        mcts = BatchedMCTS(game, config)
+
+        state = game.initial_state()
+        states = state[np.newaxis, ...]
+
+        policy = mcts.search(states, model, add_noise=False)[0]
+
+        assert abs(policy.sum() - 1.0) < 1e-6
+        assert np.count_nonzero(policy) == 7  # All columns legal
 
 
 if __name__ == '__main__':
