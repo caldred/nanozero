@@ -586,7 +586,7 @@ def get_game(name: str, use_rust: bool = True) -> Game:
     config = get_game_config(name)
 
     # Try Rust implementations if requested
-    if use_rust and RUST_AVAILABLE:
+    if use_rust and HAS_RUST_GAMES:
         rust_games = {
             'tictactoe': lambda cfg: RustTicTacToeWrapper(cfg),
             'connect4': lambda cfg: RustConnect4Wrapper(cfg),
@@ -614,7 +614,7 @@ def get_game(name: str, use_rust: bool = True) -> Game:
 
 def is_rust_available() -> bool:
     """Check if the Rust backend is available."""
-    return RUST_AVAILABLE
+    return HAS_RUST_GAMES
 
 
 # ============================================================================
@@ -624,9 +624,9 @@ def is_rust_available() -> bool:
 # Try to import Rust module
 try:
     from nanozero_mcts_rs import RustTicTacToe, RustConnect4, RustGo
-    RUST_AVAILABLE = True
+    HAS_RUST_GAMES = True
 except ImportError:
-    RUST_AVAILABLE = False
+    HAS_RUST_GAMES = False
 
 
 class RustTicTacToeWrapper(Game):
@@ -634,7 +634,7 @@ class RustTicTacToeWrapper(Game):
 
     def __init__(self, config: GameConfig):
         super().__init__(config)
-        if not RUST_AVAILABLE:
+        if not HAS_RUST_GAMES:
             raise ImportError("nanozero_mcts_rs not installed")
         self._rust = RustTicTacToe()
 
@@ -686,7 +686,7 @@ class RustConnect4Wrapper(Game):
 
     def __init__(self, config: GameConfig):
         super().__init__(config)
-        if not RUST_AVAILABLE:
+        if not HAS_RUST_GAMES:
             raise ImportError("nanozero_mcts_rs not installed")
         self._rust = RustConnect4()
 
@@ -733,7 +733,7 @@ class RustGoWrapper(Game):
 
     def __init__(self, config: GameConfig):
         super().__init__(config)
-        if not RUST_AVAILABLE:
+        if not HAS_RUST_GAMES:
             raise ImportError("nanozero_mcts_rs not installed")
         self.height = config.board_height
         self.width = config.board_width

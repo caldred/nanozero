@@ -9,6 +9,7 @@ import torch
 from typing import Dict, List, Optional, Tuple
 from nanozero.config import MCTSConfig
 from nanozero.game import Game
+from nanozero.common import sample_action
 
 
 class TranspositionTable:
@@ -807,37 +808,6 @@ class BatchedMCTS:
             policy /= policy.sum()
 
         return policy
-
-
-def sample_action(probs: np.ndarray, temperature: float = 1.0) -> int:
-    """
-    Sample an action from probability distribution.
-
-    Args:
-        probs: Probability distribution over actions, shape (action_size,)
-        temperature: Temperature for sampling.
-                    0 = greedy (argmax)
-                    1 = sample from distribution
-                    >1 = more uniform
-                    <1 = more peaked
-
-    Returns:
-        Sampled action index
-    """
-    if temperature == 0:
-        # Greedy selection
-        return int(np.argmax(probs))
-
-    # Apply temperature
-    if temperature != 1.0:
-        # Use log to avoid numerical issues with power
-        log_probs = np.log(probs + 1e-4)
-        log_probs = log_probs / temperature
-        probs = np.exp(log_probs - np.max(log_probs))  # Subtract max for numerical stability
-        probs = probs / probs.sum()
-
-    # Sample from distribution
-    return int(np.random.choice(len(probs), p=probs))
 
 
 # Try to import Rust MCTS backend

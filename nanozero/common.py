@@ -1,7 +1,6 @@
 """
 nanozero/common.py - Shared utilities
 """
-import os
 import random
 import torch
 import numpy as np
@@ -81,3 +80,30 @@ def load_checkpoint(
     if scaler is not None and 'scaler' in ckpt:
         scaler.load_state_dict(ckpt['scaler'])
     return ckpt.get('iteration', 0)
+
+
+def sample_action(probs: np.ndarray, temperature: float = 1.0) -> int:
+    """
+    Sample an action from probability distribution.
+
+    Args:
+        probs: Probability distribution over actions, shape (action_size,)
+        temperature: Temperature for sampling.
+                    0 = greedy (argmax)
+                    1 = sample from distribution
+                    >1 = more uniform
+                    <1 = more peaked
+
+    Returns:
+        Sampled action index
+    """
+    if temperature == 0:
+        return int(np.argmax(probs))
+
+    if temperature != 1.0:
+        log_probs = np.log(probs + 1e-8)
+        log_probs = log_probs / temperature
+        probs = np.exp(log_probs - np.max(log_probs))
+        probs = probs / probs.sum()
+
+    return int(np.random.choice(len(probs), p=probs))

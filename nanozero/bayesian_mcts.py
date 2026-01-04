@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from nanozero.config import BayesianMCTSConfig
 from nanozero.game import Game
 from nanozero.mcts import TranspositionTable
+from nanozero.common import sample_action
 
 
 def normal_cdf(x: float) -> float:
@@ -766,7 +767,7 @@ class BayesianMCTS:
             # else: child's mu/sigma_sq were updated in previous iteration
 
             # Aggregate parent's children
-            # TODO: experiment with visited_only=False to include prior information
+            # TODO: ablation - test visited_only=False to include prior information
             parent.aggregate_children(self.config.prune_threshold, visited_only=True)
 
             # Copy aggregated belief to own belief (no Bayesian update!)
@@ -844,26 +845,3 @@ class BayesianMCTS:
                 policy[action] = scores[i] / total
 
         return policy
-
-
-def sample_action(probs: np.ndarray, temperature: float = 1.0) -> int:
-    """
-    Sample an action from probability distribution.
-
-    Args:
-        probs: Probability distribution over actions, shape (action_size,)
-        temperature: Temperature for sampling (0 = greedy)
-
-    Returns:
-        Sampled action index
-    """
-    if temperature == 0:
-        return int(np.argmax(probs))
-
-    if temperature != 1.0:
-        log_probs = np.log(probs + 1e-8)
-        log_probs = log_probs / temperature
-        probs = np.exp(log_probs - np.max(log_probs))
-        probs = probs / probs.sum()
-
-    return int(np.random.choice(len(probs), p=probs))

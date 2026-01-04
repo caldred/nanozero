@@ -1,7 +1,6 @@
 """
 nanozero/model.py - Transformer policy-value network
 """
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
