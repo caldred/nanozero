@@ -2,7 +2,7 @@
 scripts/train.py - Main training loop for NanoZero
 
 Usage:
-    python -m scripts.train --game=tictactoe --n_layer=2 --num_iterations=50
+    python -m scripts.train --game=connect4 --n_layer=4 --num_iterations=100
 """
 import argparse
 import os
@@ -177,63 +177,66 @@ def train_step(model, optimizer, scaler, states, policies, values, action_masks,
 
 
 @torch.inference_mode()
-def evaluate_vs_random(game, model, mcts, num_games=50, mcts_simulations=25):
+def evaluate_vs_random(game, model, mcts, num_games=50):
     """
     Evaluate model against random player.
+    Runs all games in parallel with batched MCTS.
 
     Args:
         game: Game instance
         model: Neural network
         mcts: MCTS instance
         num_games: Number of games to play
-        mcts_simulations: Number of MCTS simulations per move
 
     Returns:
         Win rate against random player
     """
     model.eval()
-    wins = 0
-    draws = 0
 
-    for i in range(num_games):
-        state = game.initial_state()
+    # Initialize all games
+    states = [game.initial_state() for _ in range(num_games)]
+    model_players = [1 if i % 2 == 0 else -1 for i in range(num_games)]
+    results = [None] * num_games  # None = ongoing
 
-        # Alternate who goes first
-        model_player = 1 if i % 2 == 0 else -1
+    while any(r is None for r in results):
+        # Find games where it's the model's turn
+        model_turn_indices = []
+        random_turn_indices = []
 
-        while not game.is_terminal(state):
+        for i, (state, result) in enumerate(zip(states, results)):
+            if result is not None:
+                continue
+            if game.is_terminal(state):
+                # Game just ended
+                reward = game.terminal_reward(state)
+                final_player = game.current_player(state)
+                model_result = reward if final_player == model_players[i] else -reward
+                results[i] = model_result
+                continue
+
             current = game.current_player(state)
-
-            if current == model_player:
-                # Model's turn - pass raw state, BatchedMCTS canonicalizes internally
-                policy = mcts.search(
-                    state[np.newaxis, ...],
-                    model,
-                    num_simulations=mcts_simulations,
-                    add_noise=False
-                )[0]
-                action = sample_action(policy, temperature=0)
+            if current == model_players[i]:
+                model_turn_indices.append(i)
             else:
-                # Random player's turn
-                legal = game.legal_actions(state)
-                action = np.random.choice(legal)
+                random_turn_indices.append(i)
 
-            state = game.next_state(state, action)
+        # Batch MCTS for all model moves
+        if model_turn_indices:
+            model_states = np.stack([states[i] for i in model_turn_indices])
+            policies = mcts.search(model_states, model, add_noise=False)
 
-        # Get result
-        reward = game.terminal_reward(state)
-        final_player = game.current_player(state)
+            for idx, game_idx in enumerate(model_turn_indices):
+                action = sample_action(policies[idx], temperature=0)
+                states[game_idx] = game.next_state(states[game_idx], action)
 
-        if final_player == model_player:
-            model_result = reward
-        else:
-            model_result = -reward
+        # Random moves (no batching needed)
+        for game_idx in random_turn_indices:
+            legal = game.legal_actions(states[game_idx])
+            action = np.random.choice(legal)
+            states[game_idx] = game.next_state(states[game_idx], action)
 
-        if model_result > 0:
-            wins += 1
-        elif model_result == 0:
-            draws += 1
-
+    wins = sum(1 for r in results if r > 0)
+    draws = sum(1 for r in results if r == 0)
     return wins / num_games
 
 
@@ -241,7 +244,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train NanoZero')
 
     # Game settings
-    parser.add_argument('--game', type=str, default='tictactoe',
+    parser.add_argument('--game', type=str, default='connect4',
                         help='Game to train on (tictactoe, connect4, go9x9, go19x19)')
 
     # Model settings
@@ -255,7 +258,7 @@ def main():
                         help='Self-play games per iteration')
     parser.add_argument('--training_steps', type=int, default=100,
                         help='Training steps per iteration')
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='Training batch size')
     parser.add_argument('--buffer_size', type=int, default=100000,
                         help='Replay buffer size')
@@ -265,12 +268,18 @@ def main():
                         help='Weight decay')
 
     # MCTS settings
-    parser.add_argument('--mcts_simulations', type=int, default=50,
+    parser.add_argument('--mcts_simulations', type=int, default=500,
                         help='MCTS simulations per move')
+    parser.add_argument('--c_puct', type=float, default=1.5,
+                        help='PUCT exploration constant')
+    parser.add_argument('--dirichlet_alpha', type=float, default=None,
+                        help='Dirichlet noise alpha (default: 10/action_size)')
     parser.add_argument('--temperature_threshold', type=int, default=15,
                         help='Move number after which temperature is 0')
     parser.add_argument('--parallel_games', type=int, default=64,
                         help='Number of games to run in parallel during self-play')
+    parser.add_argument('--leaves_per_batch', type=int, default=None,
+                        help='Leaves per NN batch (default: parallel_games)')
     parser.add_argument('--no_transposition_table', action='store_true',
                         help='Disable symmetry-aware transposition table in MCTS')
 
@@ -279,6 +288,8 @@ def main():
                         help='Save checkpoint every N iterations')
     parser.add_argument('--eval_interval', type=int, default=10,
                         help='Evaluate every N iterations')
+    parser.add_argument('--eval_games', type=int, default=50,
+                        help='Number of games for evaluation')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
                         help='Directory for checkpoints')
 
@@ -322,10 +333,19 @@ def main():
     if use_amp:
         print0("Using mixed precision training (FP16)")
 
-    # Create MCTS
-    mcts_config = MCTSConfig(num_simulations=args.mcts_simulations)
+    # MCTS configuration with game-appropriate defaults
+    dirichlet_alpha = args.dirichlet_alpha if args.dirichlet_alpha is not None else 10.0 / game.config.action_size
+    leaves_per_batch = args.leaves_per_batch if args.leaves_per_batch is not None else args.parallel_games
+
+    mcts_config = MCTSConfig(
+        num_simulations=args.mcts_simulations,
+        c_puct=args.c_puct,
+        dirichlet_alpha=dirichlet_alpha,
+    )
     use_tt = not args.no_transposition_table
-    mcts = BatchedMCTS(game, mcts_config, use_transposition_table=use_tt)
+    mcts = BatchedMCTS(game, mcts_config, leaves_per_batch=leaves_per_batch, use_transposition_table=use_tt)
+
+    print0(f"MCTS: {args.mcts_simulations} sims, c_puct={args.c_puct}, alpha={dirichlet_alpha:.2f}")
     if not use_tt:
         print0("Transposition table disabled")
 
@@ -343,8 +363,8 @@ def main():
 
     print0(f"\nStarting training for {args.num_iterations} iterations")
     print0(f"  {args.games_per_iteration} games/iteration ({args.parallel_games} parallel)")
-    print0(f"  {args.training_steps} training steps/iteration")
-    print0(f"  {args.mcts_simulations} MCTS simulations/move")
+    print0(f"  {args.training_steps} training steps/iteration (batch size {args.batch_size})")
+    print0(f"  Eval every {args.eval_interval} iterations")
     print0("")
 
     # Training loop
@@ -409,7 +429,7 @@ def main():
         # Evaluation
         if (iteration + 1) % args.eval_interval == 0:
             print0("  Evaluating vs random...")
-            win_rate = evaluate_vs_random(game, model, mcts, num_games=50)
+            win_rate = evaluate_vs_random(game, model, mcts, num_games=args.eval_games)
             print0(f"  Win rate vs random: {win_rate:.1%}")
 
         # Checkpoint

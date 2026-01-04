@@ -1,11 +1,12 @@
 """
-scripts/train_bayesian.py - Quick test training with BayesianMCTS
-
-Verifies the BayesianMCTS implementation works end-to-end for training.
+scripts/train_bayesian.py - Training with BayesianMCTS (TTTS-IDS)
 
 Usage:
-    python -m scripts.train_bayesian
+    python -m scripts.train_bayesian --game=connect4 --n_layer=4 --num_iterations=100
 """
+import argparse
+import os
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,19 +14,27 @@ import torch.nn.functional as F
 from nanozero.game import get_game
 from nanozero.model import AlphaZeroTransformer
 from nanozero.mcts import BayesianMCTS
-from nanozero.config import BayesianMCTSConfig
+from nanozero.config import BayesianMCTSConfig, get_model_config
 from nanozero.common import sample_action
 from nanozero.replay import ReplayBuffer
-from nanozero.config import get_model_config
-from nanozero.common import get_device, set_seed, print0
+from nanozero.common import get_device, set_seed, print0, save_checkpoint, load_checkpoint, AverageMeter
 
 
 @torch.inference_mode()
-def self_play_games_bayesian(game, model, mcts, num_games, temperature_threshold=10, parallel_games=16):
+def self_play_games(game, model, mcts, num_games, temperature_threshold=15, parallel_games=64):
     """
-    Play multiple games of self-play using BayesianMCTS.
+    Play multiple games of self-play in parallel using BayesianMCTS.
 
-    Uses the new interleaved batching for GPU efficiency.
+    Args:
+        game: Game instance
+        model: Neural network
+        mcts: BayesianMCTS instance
+        num_games: Total number of games to play
+        temperature_threshold: Move number after which temperature becomes 0
+        parallel_games: Number of games to run in parallel
+
+    Returns:
+        List of all (canonical_state, policy, value) tuples from all games
     """
     model.eval()
     all_examples = []
@@ -47,7 +56,7 @@ def self_play_games_bayesian(game, model, mcts, num_games, temperature_threshold
         # Batch all active states for MCTS
         active_states = np.stack([states[i] for i in active_indices])
 
-        # Use BayesianMCTS search (now with interleaved batching!)
+        # BayesianMCTS search (no add_noise parameter - uses Thompson sampling)
         policies = mcts.search(active_states, model)
 
         # Process each active game
@@ -76,10 +85,7 @@ def self_play_games_bayesian(game, model, mcts, num_games, temperature_threshold
                 final_player = game.current_player(states[i])
 
                 for canonical, policy, player in game_examples[i]:
-                    if player == final_player:
-                        value = reward
-                    else:
-                        value = -reward
+                    value = reward if player == final_player else -reward
 
                     # Add symmetries for data augmentation
                     for sym_state, sym_policy in game.symmetries(canonical, policy):
@@ -93,11 +99,14 @@ def self_play_games_bayesian(game, model, mcts, num_games, temperature_threshold
                     move_counts[i] = 0
                     game_examples[i] = []
 
+                if games_completed % 10 == 0:
+                    print0(f"  Self-play: {games_completed}/{num_games} games")
+
     return all_examples
 
 
-def train_step(model, optimizer, states, policies, values, action_masks, device):
-    """Simple training step without mixed precision for simplicity."""
+def train_step(model, optimizer, scaler, states, policies, values, action_masks, device, use_amp):
+    """Perform a single training step with optional mixed precision."""
     model.train()
 
     states = states.to(device)
@@ -107,103 +116,217 @@ def train_step(model, optimizer, states, policies, values, action_masks, device)
 
     optimizer.zero_grad()
 
-    pred_log_policies, pred_values = model(states, action_masks)
+    with torch.amp.autocast('cuda', enabled=use_amp):
+        pred_log_policies, pred_values = model(states, action_masks)
+        policy_loss = -torch.mean(torch.sum(policies * pred_log_policies, dim=1))
+        value_loss = F.mse_loss(pred_values.squeeze(-1), values)
+        loss = policy_loss + value_loss
 
-    # Policy loss: cross-entropy
-    policy_loss = -torch.mean(torch.sum(policies * pred_log_policies, dim=1))
-
-    # Value loss: MSE
-    value_loss = F.mse_loss(pred_values.squeeze(-1), values)
-
-    loss = policy_loss + value_loss
-    loss.backward()
-    optimizer.step()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
 
     return loss.item(), policy_loss.item(), value_loss.item()
 
 
 @torch.inference_mode()
-def evaluate_vs_random(game, model, mcts, num_games=20):
-    """Quick evaluation against random player."""
+def evaluate_vs_random(game, model, mcts, num_games=50):
+    """
+    Evaluate model against random player.
+    Runs all games in parallel with batched MCTS.
+    """
     model.eval()
-    wins = 0
 
-    for i in range(num_games):
-        state = game.initial_state()
-        model_player = 1 if i % 2 == 0 else -1
+    # Initialize all games
+    states = [game.initial_state() for _ in range(num_games)]
+    model_players = [1 if i % 2 == 0 else -1 for i in range(num_games)]
+    results = [None] * num_games
 
-        while not game.is_terminal(state):
+    while any(r is None for r in results):
+        model_turn_indices = []
+        random_turn_indices = []
+
+        for i, (state, result) in enumerate(zip(states, results)):
+            if result is not None:
+                continue
+            if game.is_terminal(state):
+                reward = game.terminal_reward(state)
+                final_player = game.current_player(state)
+                model_result = reward if final_player == model_players[i] else -reward
+                results[i] = model_result
+                continue
+
             current = game.current_player(state)
-
-            if current == model_player:
-                policy = mcts.search(state[np.newaxis, ...], model, num_simulations=25)[0]
-                action = sample_action(policy, temperature=0)
+            if current == model_players[i]:
+                model_turn_indices.append(i)
             else:
-                legal = game.legal_actions(state)
-                action = np.random.choice(legal)
+                random_turn_indices.append(i)
 
-            state = game.next_state(state, action)
+        # Batch MCTS for all model moves
+        if model_turn_indices:
+            model_states = np.stack([states[i] for i in model_turn_indices])
+            policies = mcts.search(model_states, model)
 
-        reward = game.terminal_reward(state)
-        final_player = game.current_player(state)
+            for idx, game_idx in enumerate(model_turn_indices):
+                action = sample_action(policies[idx], temperature=0)
+                states[game_idx] = game.next_state(states[game_idx], action)
 
-        if final_player == model_player:
-            model_result = reward
-        else:
-            model_result = -reward
+        # Random moves
+        for game_idx in random_turn_indices:
+            legal = game.legal_actions(states[game_idx])
+            action = np.random.choice(legal)
+            states[game_idx] = game.next_state(states[game_idx], action)
 
-        if model_result > 0:
-            wins += 1
-
+    wins = sum(1 for r in results if r > 0)
     return wins / num_games
 
 
 def main():
-    set_seed(42)
-    device = get_device()
+    parser = argparse.ArgumentParser(description='Train NanoZero with BayesianMCTS')
+
+    # Game settings
+    parser.add_argument('--game', type=str, default='connect4',
+                        help='Game to train on (tictactoe, connect4, go9x9, go19x19)')
+
+    # Model settings
+    parser.add_argument('--n_layer', type=int, default=4,
+                        help='Number of transformer layers')
+
+    # Training settings
+    parser.add_argument('--num_iterations', type=int, default=100,
+                        help='Number of training iterations')
+    parser.add_argument('--games_per_iteration', type=int, default=100,
+                        help='Self-play games per iteration')
+    parser.add_argument('--training_steps', type=int, default=100,
+                        help='Training steps per iteration')
+    parser.add_argument('--batch_size', type=int, default=128,
+                        help='Training batch size')
+    parser.add_argument('--buffer_size', type=int, default=100000,
+                        help='Replay buffer size')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='Weight decay')
+
+    # MCTS settings
+    parser.add_argument('--mcts_simulations', type=int, default=500,
+                        help='MCTS simulations per move')
+    parser.add_argument('--sigma_0', type=float, default=1.0,
+                        help='Prior standard deviation for Bayesian beliefs')
+    parser.add_argument('--obs_var', type=float, default=0.5,
+                        help='Observation variance for NN value updates')
+    parser.add_argument('--ids_alpha', type=float, default=0.5,
+                        help='IDS pseudocount for exploration')
+    parser.add_argument('--temperature_threshold', type=int, default=15,
+                        help='Move number after which temperature is 0')
+    parser.add_argument('--parallel_games', type=int, default=64,
+                        help='Number of games to run in parallel')
+    parser.add_argument('--leaves_per_batch', type=int, default=None,
+                        help='Leaves per NN batch (default: parallel_games)')
+    parser.add_argument('--early_stopping', action='store_true', default=True,
+                        help='Enable early stopping when confident')
+    parser.add_argument('--no_early_stopping', action='store_false', dest='early_stopping',
+                        help='Disable early stopping')
+    parser.add_argument('--confidence_threshold', type=float, default=0.95,
+                        help='Confidence threshold for early stopping')
+
+    # Checkpointing and evaluation
+    parser.add_argument('--checkpoint_interval', type=int, default=10,
+                        help='Save checkpoint every N iterations')
+    parser.add_argument('--eval_interval', type=int, default=10,
+                        help='Evaluate every N iterations')
+    parser.add_argument('--eval_games', type=int, default=50,
+                        help='Number of games for evaluation')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory for checkpoints')
+
+    # Misc
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Device (auto, cpu, cuda, mps)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from checkpoint')
+
+    args = parser.parse_args()
+
+    # Set seed
+    set_seed(args.seed)
+
+    # Get device
+    device = get_device() if args.device == 'auto' else torch.device(args.device)
     print0(f"Using device: {device}")
 
     # Create game
-    game = get_game('tictactoe')
-    print0(f"Game: tictactoe (backend: {game.backend})")
+    game = get_game(args.game)
+    print0(f"Game: {args.game} (backend: {game.backend})")
+    print0(f"Board size: {game.config.board_size}, Action size: {game.config.action_size}")
 
-    # Create small model for quick testing
-    model_config = get_model_config(game.config, n_layer=2)
+    # Create model
+    model_config = get_model_config(game.config, n_layer=args.n_layer)
     model = AlphaZeroTransformer(model_config).to(device)
     print0(f"Model: {model.count_parameters():,} parameters")
 
     # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-
-    # Create BayesianMCTS with reasonable settings for quick test
-    mcts_config = BayesianMCTSConfig(
-        num_simulations=50,
-        early_stopping=True,
-        confidence_threshold=0.9,
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
     )
-    mcts = BayesianMCTS(game, mcts_config)
-    print0(f"Using BayesianMCTS with {mcts_config.num_simulations} simulations")
+
+    # Mixed precision setup
+    use_amp = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    if use_amp:
+        print0("Using mixed precision training (FP16)")
+
+    # BayesianMCTS configuration
+    leaves_per_batch = args.leaves_per_batch if args.leaves_per_batch is not None else args.parallel_games
+
+    mcts_config = BayesianMCTSConfig(
+        num_simulations=args.mcts_simulations,
+        sigma_0=args.sigma_0,
+        obs_var=args.obs_var,
+        ids_alpha=args.ids_alpha,
+        early_stopping=args.early_stopping,
+        confidence_threshold=args.confidence_threshold,
+    )
+    mcts = BayesianMCTS(game, mcts_config, leaves_per_batch=leaves_per_batch)
+
+    print0(f"BayesianMCTS: {args.mcts_simulations} sims, sigma_0={args.sigma_0}, obs_var={args.obs_var}")
+    print0(f"  IDS alpha={args.ids_alpha}, early_stopping={args.early_stopping}")
 
     # Create replay buffer
-    buffer = ReplayBuffer(10000)
+    buffer = ReplayBuffer(args.buffer_size)
 
-    # Quick training loop
-    num_iterations = 5
-    games_per_iteration = 20
-    training_steps = 50
-    batch_size = 32
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    print0(f"\nQuick test: {num_iterations} iterations, {games_per_iteration} games each\n")
+    # Resume from checkpoint if specified
+    start_iteration = 0
+    if args.resume:
+        start_iteration = load_checkpoint(args.resume, model, optimizer, scaler=scaler)
+        print0(f"Resumed from iteration {start_iteration}")
 
-    for iteration in range(num_iterations):
-        print0(f"Iteration {iteration + 1}/{num_iterations}")
+    print0(f"\nStarting training for {args.num_iterations} iterations")
+    print0(f"  {args.games_per_iteration} games/iteration ({args.parallel_games} parallel)")
+    print0(f"  {args.training_steps} training steps/iteration (batch size {args.batch_size})")
+    print0(f"  Eval every {args.eval_interval} iterations")
+    print0("")
 
-        # Self-play with BayesianMCTS
+    # Training loop
+    for iteration in range(start_iteration, args.num_iterations):
+        iter_start = time.time()
+
+        print0(f"Iteration {iteration + 1}/{args.num_iterations}")
+
+        # Self-play
         print0("  Self-play...")
-        examples = self_play_games_bayesian(
+        examples = self_play_games(
             game, model, mcts,
-            num_games=games_per_iteration,
-            parallel_games=8
+            num_games=args.games_per_iteration,
+            temperature_threshold=args.temperature_threshold,
+            parallel_games=args.parallel_games
         )
 
         # Add to buffer
@@ -213,12 +336,14 @@ def main():
         print0(f"  Collected {len(examples)} examples, buffer size: {len(buffer)}")
 
         # Training
-        if len(buffer) >= batch_size:
+        if len(buffer) >= args.batch_size:
             print0("  Training...")
-            total_loss = 0
+            loss_meter = AverageMeter()
+            policy_loss_meter = AverageMeter()
+            value_loss_meter = AverageMeter()
 
-            for step in range(training_steps):
-                states, policies, values = buffer.sample(batch_size)
+            for step in range(args.training_steps):
+                states, policies, values = buffer.sample(args.batch_size)
 
                 state_tensors = torch.stack([game.to_tensor(s) for s in states])
                 policy_tensors = torch.from_numpy(policies).float()
@@ -228,28 +353,49 @@ def main():
                     for s in states
                 ]).float()
 
-                loss, _, _ = train_step(
-                    model, optimizer,
+                loss, policy_loss, value_loss = train_step(
+                    model, optimizer, scaler,
                     state_tensors, policy_tensors, value_tensors,
-                    action_mask_tensors, device
+                    action_mask_tensors, device, use_amp
                 )
-                total_loss += loss
 
-            print0(f"  Avg loss: {total_loss / training_steps:.4f}")
+                loss_meter.update(loss)
+                policy_loss_meter.update(policy_loss)
+                value_loss_meter.update(value_loss)
+
+            print0(f"  Loss: {loss_meter.avg:.4f} (policy: {policy_loss_meter.avg:.4f}, value: {value_loss_meter.avg:.4f})")
             mcts.clear_cache()
 
         # Evaluation
-        print0("  Evaluating vs random...")
-        win_rate = evaluate_vs_random(game, model, mcts, num_games=20)
-        print0(f"  Win rate vs random: {win_rate:.1%}")
+        if (iteration + 1) % args.eval_interval == 0:
+            print0("  Evaluating vs random...")
+            win_rate = evaluate_vs_random(game, model, mcts, num_games=args.eval_games)
+            print0(f"  Win rate vs random: {win_rate:.1%}")
+
+        # Checkpoint
+        if (iteration + 1) % args.checkpoint_interval == 0:
+            ckpt_path = os.path.join(
+                args.checkpoint_dir,
+                f"{args.game}_bayesian_iter{iteration + 1}.pt"
+            )
+            save_checkpoint(model, optimizer, iteration + 1, ckpt_path, scaler=scaler)
+            print0(f"  Saved checkpoint: {ckpt_path}")
+
+        iter_time = time.time() - iter_start
+        print0(f"  Iteration time: {iter_time:.1f}s")
         print0("")
 
+    # Save final checkpoint
+    final_path = os.path.join(args.checkpoint_dir, f"{args.game}_bayesian_final.pt")
+    save_checkpoint(model, optimizer, args.num_iterations, final_path, scaler=scaler)
+    print0(f"Saved final checkpoint: {final_path}")
+
     # Final evaluation
-    print0("Final evaluation (more games):")
-    win_rate = evaluate_vs_random(game, model, mcts, num_games=50)
+    print0("\nFinal evaluation:")
+    win_rate = evaluate_vs_random(game, model, mcts, num_games=100)
     print0(f"  Win rate vs random: {win_rate:.1%}")
 
-    print0("\nBayesianMCTS training test complete!")
+    print0("\nTraining complete!")
 
 
 if __name__ == '__main__':

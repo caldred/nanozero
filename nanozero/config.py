@@ -51,7 +51,7 @@ class BayesianMCTSConfig:
     Note: No Dirichlet noise - Thompson sampling provides exploration naturally.
     Note: No temperature - policy is probability of optimality via Thompson sampling.
     """
-    num_simulations: int = 1000
+    num_simulations: int = 100
 
     # Bayesian prior hyperparameters
     sigma_0: float = 1.0          # Prior std for logit-shifted initialization
