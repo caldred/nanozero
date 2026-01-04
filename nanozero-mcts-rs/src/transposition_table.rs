@@ -1,6 +1,7 @@
 //! Transposition table for MCTS with symmetry support.
 //!
-//! Caches position evaluations to reuse across searches and symmetric positions.
+//! Caches NN policy/value evaluations to reuse across searches and symmetric positions.
+//! Used by both PUCT and Bayesian MCTS - both cache the same NN output (policy priors + value).
 //! Entries persist until explicitly cleared (typically when the model is retrained).
 
 use std::collections::HashMap;
@@ -61,50 +62,6 @@ impl Default for TranspositionEntry {
     }
 }
 
-/// Bayesian MCTS entry with Gaussian beliefs.
-#[derive(Clone, Debug)]
-pub struct BayesianTranspositionEntry {
-    /// Visit count
-    pub visits: u32,
-    /// Mean of belief distribution
-    pub mu: f32,
-    /// Variance of belief distribution
-    pub sigma_sq: f32,
-    /// Child statistics with Gaussian beliefs
-    pub children: Vec<BayesianChildStats>,
-}
-
-/// Bayesian statistics for a child action.
-#[derive(Clone, Debug)]
-pub struct BayesianChildStats {
-    pub action: u16,
-    pub prior: f32,
-    pub visits: u32,
-    pub mu: f32,
-    pub sigma_sq: f32,
-}
-
-impl BayesianTranspositionEntry {
-    pub fn new() -> Self {
-        Self {
-            visits: 0,
-            mu: 0.0,
-            sigma_sq: 1.0,
-            children: Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn expanded(&self) -> bool {
-        !self.children.is_empty()
-    }
-}
-
-impl Default for BayesianTranspositionEntry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Transposition table for standard PUCT MCTS.
 ///
@@ -203,85 +160,6 @@ impl Default for TranspositionTable {
     }
 }
 
-/// Transposition table for Bayesian MCTS.
-pub struct BayesianTranspositionTable {
-    entries: HashMap<u64, BayesianTranspositionEntry>,
-    hits: u64,
-    misses: u64,
-}
-
-impl BayesianTranspositionTable {
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            hits: 0,
-            misses: 0,
-        }
-    }
-
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: HashMap::with_capacity(capacity),
-            hits: 0,
-            misses: 0,
-        }
-    }
-
-    pub fn get(&mut self, hash: u64) -> Option<&BayesianTranspositionEntry> {
-        if let Some(entry) = self.entries.get(&hash) {
-            self.hits += 1;
-            Some(entry)
-        } else {
-            self.misses += 1;
-            None
-        }
-    }
-
-    pub fn get_or_insert(&mut self, hash: u64) -> &mut BayesianTranspositionEntry {
-        self.entries.entry(hash).or_insert_with(BayesianTranspositionEntry::new)
-    }
-
-    pub fn get_mut(&mut self, hash: u64) -> Option<&mut BayesianTranspositionEntry> {
-        self.entries.get_mut(&hash)
-    }
-
-    pub fn insert(&mut self, hash: u64, entry: BayesianTranspositionEntry) {
-        self.entries.insert(hash, entry);
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.hits = 0;
-        self.misses = 0;
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
-            0.0
-        } else {
-            self.hits as f64 / total as f64
-        }
-    }
-
-    pub fn stats(&self) -> (u64, u64, usize) {
-        (self.hits, self.misses, self.entries.len())
-    }
-}
-
-impl Default for BayesianTranspositionTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -15,10 +15,7 @@ use crate::search::{
     apply_virtual_loss, backup_with_virtual_loss_removal, select_child_with_virtual_loss,
     SearchPath,
 };
-use crate::transposition_table::{
-    BayesianChildStats, BayesianTranspositionEntry, BayesianTranspositionTable, ChildStats,
-    TranspositionEntry, TranspositionTable,
-};
+use crate::transposition_table::{ChildStats, TranspositionTable};
 use crate::tree::TreeArena;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -665,7 +662,7 @@ pub struct PyBayesianMCTS {
     /// Random number generator
     rng: rand::rngs::StdRng,
     /// Transposition table for caching positions (persists across searches)
-    transposition_table: BayesianTranspositionTable,
+    transposition_table: TranspositionTable,
     /// Whether to use the transposition table
     use_transposition_table: bool,
 }
@@ -738,7 +735,7 @@ impl PyBayesianMCTS {
             leaves_per_batch,
             virtual_loss_value,
             rng,
-            transposition_table: BayesianTranspositionTable::with_capacity(10000),
+            transposition_table: TranspositionTable::with_capacity(10000),
             use_transposition_table,
         }
     }
@@ -815,11 +812,25 @@ impl PyBayesianMCTS {
         let num_states = states_arr.nrows();
         let action_size = game.action_size();
 
-        // Convert input states to GameStates
+        // Convert input states to GameStates and compute canonical hashes
         let mut game_states: Vec<GameState> = Vec::with_capacity(num_states);
+        let mut root_hashes: Vec<u64> = Vec::with_capacity(num_states);
+        let mut root_sym_indices: Vec<usize> = Vec::with_capacity(num_states);
+
         for i in 0..num_states {
             let row = states_arr.row(i);
             let state = game.state_from_slice(row.as_slice().unwrap());
+            let canonical = game.canonical_state(&state);
+
+            if self.use_transposition_table {
+                let (sym_idx, hash) = game.canonical_symmetry_index(&canonical);
+                root_hashes.push(hash);
+                root_sym_indices.push(sym_idx);
+            } else {
+                root_hashes.push(0);
+                root_sym_indices.push(0);
+            }
+
             game_states.push(state);
         }
 
@@ -831,16 +842,75 @@ impl PyBayesianMCTS {
             arenas.push(arena);
         }
 
-        // Expand roots with NN
-        let (root_policies, root_values) =
-            self.call_nn(py, &nn_callback, &game_states, game)?;
+        // Check transposition table for cached root evaluations
+        let mut roots_need_nn: Vec<usize> = Vec::new();
+        let mut cached_policies: Vec<Option<(Vec<f32>, f32)>> = vec![None; num_states];
 
+        if self.use_transposition_table {
+            for state_idx in 0..num_states {
+                let hash = root_hashes[state_idx];
+                let sym_idx = root_sym_indices[state_idx];
+
+                if let Some(entry) = self.transposition_table.get(hash) {
+                    if entry.expanded() {
+                        let mut policy = vec![0.0f32; action_size];
+                        for child in &entry.children {
+                            let orig_action = game.unmap_action(child.action, sym_idx);
+                            policy[orig_action as usize] = child.prior;
+                        }
+                        cached_policies[state_idx] = Some((policy, entry.value()));
+                        continue;
+                    }
+                }
+                roots_need_nn.push(state_idx);
+            }
+        } else {
+            roots_need_nn = (0..num_states).collect();
+        }
+
+        // Call NN only for states not in cache
+        if !roots_need_nn.is_empty() {
+            let states_for_nn: Vec<GameState> = roots_need_nn
+                .iter()
+                .map(|&i| game_states[i].clone())
+                .collect();
+
+            let (policies, values) = self.call_nn(py, &nn_callback, &states_for_nn, game)?;
+
+            for (nn_idx, &state_idx) in roots_need_nn.iter().enumerate() {
+                let policy = policies[nn_idx].clone();
+                let value = values[nn_idx];
+                cached_policies[state_idx] = Some((policy.clone(), value));
+
+                // Store in transposition table
+                if self.use_transposition_table {
+                    let hash = root_hashes[state_idx];
+                    let sym_idx = root_sym_indices[state_idx];
+                    let state = &game_states[state_idx];
+
+                    let entry = self.transposition_table.get_or_insert(hash);
+                    entry.visits = 1;
+                    entry.value_sum = value;
+
+                    let legal_actions = game.legal_actions(state);
+                    for action in legal_actions {
+                        let canon_action = game.map_action(action, sym_idx);
+                        entry.children.push(ChildStats {
+                            action: canon_action,
+                            prior: policy[action as usize],
+                            visits: 0,
+                            value_sum: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Initialize trees with policies
         for (state_idx, arena) in arenas.iter_mut().enumerate() {
             let state = &game_states[state_idx];
-            let policy = &root_policies[state_idx];
-            let value = root_values[state_idx];
+            let (policy, value) = cached_policies[state_idx].as_ref().unwrap();
 
-            // Get legal actions and priors
             let legal_actions = game.legal_actions(state);
             let mut actions: Vec<u16> = Vec::new();
             let mut priors: Vec<f32> = Vec::new();
@@ -859,7 +929,7 @@ impl PyBayesianMCTS {
             }
 
             // Create children with logit-shifted initialization
-            let children_params = create_bayesian_children(value, &priors, self.sigma_0);
+            let children_params = create_bayesian_children(*value, &priors, self.sigma_0);
             arena.add_children(0, &actions, &children_params);
 
             // Initialize aggregated belief at root
@@ -967,18 +1037,82 @@ impl PyBayesianMCTS {
 
             // Expand non-terminal leaves with batched NN call
             if !leaves_to_expand.is_empty() {
-                let leaf_states: Vec<GameState> = leaves_to_expand
-                    .iter()
-                    .map(|(_, _, s)| s.clone())
-                    .collect();
+                // Compute canonical hashes for all leaves
+                let mut leaf_hashes: Vec<u64> = Vec::with_capacity(leaves_to_expand.len());
+                let mut leaf_sym_indices: Vec<usize> = Vec::with_capacity(leaves_to_expand.len());
+                let mut leaves_need_nn: Vec<usize> = Vec::new();
+                let mut leaf_policies: Vec<Option<(Vec<f32>, f32)>> = vec![None; leaves_to_expand.len()];
 
-                let (policies, values) = self.call_nn(py, &nn_callback, &leaf_states, game)?;
+                for (leaf_idx, (_, _, leaf_state)) in leaves_to_expand.iter().enumerate() {
+                    let canonical = game.canonical_state(leaf_state);
 
+                    if self.use_transposition_table {
+                        let (sym_idx, hash) = game.canonical_symmetry_index(&canonical);
+                        leaf_hashes.push(hash);
+                        leaf_sym_indices.push(sym_idx);
+
+                        // Check if cached
+                        if let Some(entry) = self.transposition_table.get(hash) {
+                            if entry.expanded() {
+                                let mut policy = vec![0.0f32; action_size];
+                                for child in &entry.children {
+                                    let orig_action = game.unmap_action(child.action, sym_idx);
+                                    policy[orig_action as usize] = child.prior;
+                                }
+                                leaf_policies[leaf_idx] = Some((policy, entry.value()));
+                                continue;
+                            }
+                        }
+                    } else {
+                        leaf_hashes.push(0);
+                        leaf_sym_indices.push(0);
+                    }
+                    leaves_need_nn.push(leaf_idx);
+                }
+
+                // Call NN only for uncached leaves
+                if !leaves_need_nn.is_empty() {
+                    let states_for_nn: Vec<GameState> = leaves_need_nn
+                        .iter()
+                        .map(|&i| leaves_to_expand[i].2.clone())
+                        .collect();
+
+                    let (policies, values) = self.call_nn(py, &nn_callback, &states_for_nn, game)?;
+
+                    for (nn_idx, &leaf_idx) in leaves_need_nn.iter().enumerate() {
+                        let policy = policies[nn_idx].clone();
+                        let value = values[nn_idx];
+                        leaf_policies[leaf_idx] = Some((policy.clone(), value));
+
+                        // Store in transposition table
+                        if self.use_transposition_table {
+                            let hash = leaf_hashes[leaf_idx];
+                            let sym_idx = leaf_sym_indices[leaf_idx];
+                            let leaf_state = &leaves_to_expand[leaf_idx].2;
+
+                            let entry = self.transposition_table.get_or_insert(hash);
+                            entry.visits = 1;
+                            entry.value_sum = value;
+
+                            let legal_actions = game.legal_actions(leaf_state);
+                            for action in legal_actions {
+                                let canon_action = game.map_action(action, sym_idx);
+                                entry.children.push(ChildStats {
+                                    action: canon_action,
+                                    prior: policy[action as usize],
+                                    visits: 0,
+                                    value_sum: 0.0,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Expand all leaves
                 for (i, (state_idx, path, leaf_state)) in leaves_to_expand.iter().enumerate() {
                     let arena = &mut arenas[*state_idx];
-                    let leaf_idx = path.leaf();
-                    let policy = &policies[i];
-                    let value = values[i];
+                    let leaf_node_idx = path.leaf();
+                    let (policy, value) = leaf_policies[i].as_ref().unwrap();
 
                     // Get legal actions and priors
                     let legal_actions = game.legal_actions(leaf_state);
@@ -999,17 +1133,17 @@ impl PyBayesianMCTS {
                     }
 
                     // Create children with logit-shifted initialization
-                    let children_params = create_bayesian_children(value, &priors, self.sigma_0);
-                    arena.add_children(leaf_idx, &actions, &children_params);
+                    let children_params = create_bayesian_children(*value, &priors, self.sigma_0);
+                    arena.add_children(leaf_node_idx, &actions, &children_params);
 
                     // Initialize aggregated belief for the expanded node
-                    arena.update_aggregated(leaf_idx, self.prune_threshold, false);
+                    arena.update_aggregated(leaf_node_idx, self.prune_threshold, false);
 
                     // Backup (also removes virtual loss)
                     bayesian_backup_with_virtual_loss_removal(
                         arena,
                         path,
-                        value,
+                        *value,
                         self.obs_var,
                         self.min_variance,
                         self.prune_threshold,
