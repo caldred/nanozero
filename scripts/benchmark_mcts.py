@@ -18,9 +18,8 @@ from typing import Dict, List, Optional, Tuple
 
 from nanozero.game import get_game, Game
 from nanozero.model import AlphaZeroTransformer
-from nanozero.mcts import BatchedMCTS, MCTSConfig
-from nanozero.bayesian_mcts import BayesianMCTS, BayesianMCTSConfig
-from nanozero.config import get_model_config
+from nanozero.mcts import BatchedMCTS, BayesianMCTS
+from nanozero.config import get_model_config, MCTSConfig, BayesianMCTSConfig
 from nanozero.common import get_device, load_checkpoint
 
 

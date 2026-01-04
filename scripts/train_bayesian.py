@@ -12,8 +12,9 @@ import torch.nn.functional as F
 
 from nanozero.game import get_game
 from nanozero.model import AlphaZeroTransformer
-from nanozero.bayesian_mcts import BayesianMCTS, BayesianMCTSConfig
-from nanozero.mcts import sample_action
+from nanozero.mcts import BayesianMCTS
+from nanozero.config import BayesianMCTSConfig
+from nanozero.common import sample_action
 from nanozero.replay import ReplayBuffer
 from nanozero.config import get_model_config
 from nanozero.common import get_device, set_seed, print0

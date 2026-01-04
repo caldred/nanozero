@@ -1,15 +1,13 @@
 """
 Tests for Game implementations (TicTacToe, Connect4, Go).
-Includes Python implementation tests and Rust/Python equivalence tests.
+All games use the Rust backend.
 """
 import numpy as np
 import pytest
 import torch
 
 from nanozero.config import get_game_config
-from nanozero.game import (
-    TicTacToe, Connect4, Go, get_game, RUST_AVAILABLE,
-)
+from nanozero.game import TicTacToe, Connect4, Go, get_game
 
 
 # ============================================================================
@@ -179,6 +177,10 @@ class TestTicTacToe:
         assert mask[4] == 0.0
         assert np.sum(mask) == 8
 
+    def test_backend_is_rust(self, game):
+        """Game uses Rust backend."""
+        assert game.backend == 'rust'
+
 
 # ============================================================================
 # Connect4 Tests
@@ -294,6 +296,10 @@ class TestConnect4:
         assert s2[5, 6] == 1  # Flipped horizontally
         assert p2[6] == 1.0
 
+    def test_backend_is_rust(self, game):
+        """Game uses Rust backend."""
+        assert game.backend == 'rust'
+
 
 # ============================================================================
 # Go Tests
@@ -353,18 +359,18 @@ class TestGo:
     def test_suicide_illegal(self, game):
         """Suicide is illegal."""
         state = game.initial_state()
-        # Create a situation where playing at (0,0) would be suicide
-        state = game.next_state(state, 0*9 + 1)   # Black at (0,1)
-        state = game.next_state(state, 81)        # White passes
-        state = game.next_state(state, 1*9 + 0)   # Black at (1,0)
-        state = game.next_state(state, 81)        # White passes
+        # Create a situation where playing at (0,0) would be suicide for White
+        # We need to surround (0,0) with Black stones from Black's perspective
+        state = game.next_state(state, 0*9 + 1)   # Black at (0,1) = B9
+        state = game.next_state(state, 4*9 + 4)   # White at center (4,4)
+        state = game.next_state(state, 1*9 + 0)   # Black at (1,0) = A8
+        # Now it's White's turn. (0,0) would be suicide for White
+        # because the white stone would have no liberties (surrounded by Black on both sides)
 
-        # Now white cannot play at (0,0) - it would be suicide
+        assert game.current_player(state) == -1  # White's turn
         legal = game.legal_actions(state)
-        # (0,0) = action 0
-        # Actually, black just played, so it's white's turn
-        # White at (0,0) would be suicide
-        assert 0 not in legal
+        # Position 0 = (0,0) = A9 corner, should be suicide for White
+        assert 0 not in legal, f"Position 0 should be suicide but is in legal actions: {legal[:20]}..."
 
     def test_terminal_after_two_passes(self, game):
         """Game ends after two consecutive passes."""
@@ -392,139 +398,9 @@ class TestGo:
         for s, p in symmetries:
             assert p[81] == 0.5
 
-
-# ============================================================================
-# Rust/Python Equivalence Tests
-# ============================================================================
-
-@pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extension not available")
-class TestRustPythonEquivalence:
-    """Tests that Rust and Python implementations produce identical results."""
-
-    def test_tictactoe_equivalence(self):
-        """TicTacToe: Rust matches Python."""
-        py_game = get_game('tictactoe', use_rust=False)
-        rs_game = get_game('tictactoe', use_rust=True)
-
-        # Test initial state
-        py_state = py_game.initial_state()
-        rs_state = rs_game.initial_state()
-        np.testing.assert_array_equal(py_state, rs_state)
-
-        # Play a series of moves
-        np.random.seed(42)
-        for _ in range(100):
-            py_state = py_game.initial_state()
-            rs_state = rs_game.initial_state()
-
-            while not py_game.is_terminal(py_state):
-                # Check current player
-                assert py_game.current_player(py_state) == rs_game.current_player(rs_state)
-
-                # Check legal actions
-                py_legal = set(py_game.legal_actions(py_state))
-                rs_legal = set(rs_game.legal_actions(rs_state))
-                assert py_legal == rs_legal
-
-                # Check legal actions mask
-                np.testing.assert_array_equal(
-                    py_game.legal_actions_mask(py_state),
-                    rs_game.legal_actions_mask(rs_state)
-                )
-
-                # Make a random move
-                action = np.random.choice(list(py_legal))
-                py_state = py_game.next_state(py_state, action)
-                rs_state = rs_game.next_state(rs_state, action)
-                np.testing.assert_array_equal(py_state, rs_state)
-
-            # Check terminal state
-            assert py_game.is_terminal(py_state) == rs_game.is_terminal(rs_state)
-            assert py_game.terminal_reward(py_state) == rs_game.terminal_reward(rs_state)
-
-    def test_connect4_equivalence(self):
-        """Connect4: Rust matches Python."""
-        py_game = get_game('connect4', use_rust=False)
-        rs_game = get_game('connect4', use_rust=True)
-
-        np.random.seed(42)
-        for _ in range(50):
-            py_state = py_game.initial_state()
-            rs_state = rs_game.initial_state()
-
-            while not py_game.is_terminal(py_state):
-                assert py_game.current_player(py_state) == rs_game.current_player(rs_state)
-
-                py_legal = set(py_game.legal_actions(py_state))
-                rs_legal = set(rs_game.legal_actions(rs_state))
-                assert py_legal == rs_legal
-
-                action = np.random.choice(list(py_legal))
-                py_state = py_game.next_state(py_state, action)
-                rs_state = rs_game.next_state(rs_state, action)
-                np.testing.assert_array_equal(py_state, rs_state)
-
-            assert py_game.terminal_reward(py_state) == rs_game.terminal_reward(rs_state)
-
-    def test_go_equivalence(self):
-        """Go: Rust matches Python."""
-        py_game = get_game('go9x9', use_rust=False)
-        rs_game = get_game('go9x9', use_rust=True)
-
-        np.random.seed(42)
-        for _ in range(10):  # Fewer games, Go is slower
-            py_state = py_game.initial_state()
-            rs_state = rs_game.initial_state()
-
-            move_count = 0
-            while not py_game.is_terminal(py_state) and move_count < 100:
-                assert py_game.current_player(py_state) == rs_game.current_player(rs_state)
-
-                py_legal = set(py_game.legal_actions(py_state))
-                rs_legal = set(rs_game.legal_actions(rs_state))
-                assert py_legal == rs_legal, f"Move {move_count}: legal actions differ"
-
-                action = np.random.choice(list(py_legal))
-                py_state = py_game.next_state(py_state, action)
-                rs_state = rs_game.next_state(rs_state, action)
-                np.testing.assert_array_equal(py_state, rs_state)
-                move_count += 1
-
-            assert py_game.is_terminal(py_state) == rs_game.is_terminal(rs_state)
-            if py_game.is_terminal(py_state):
-                assert py_game.terminal_reward(py_state) == rs_game.terminal_reward(rs_state)
-
-    def test_canonical_state_equivalence(self):
-        """Canonical state computation matches."""
-        for game_name in ['tictactoe', 'connect4']:
-            py_game = get_game(game_name, use_rust=False)
-            rs_game = get_game(game_name, use_rust=True)
-
-            state = py_game.initial_state()
-            # Make a move so we're player -1
-            action = py_game.legal_actions(state)[0]
-            py_state = py_game.next_state(state, action)
-            rs_state = rs_game.next_state(state, action)
-
-            py_canonical = py_game.canonical_state(py_state)
-            rs_canonical = rs_game.canonical_state(rs_state)
-            np.testing.assert_array_equal(py_canonical, rs_canonical)
-
-    def test_to_tensor_equivalence(self):
-        """Tensor conversion matches."""
-        for game_name in ['tictactoe', 'connect4']:
-            py_game = get_game(game_name, use_rust=False)
-            rs_game = get_game(game_name, use_rust=True)
-
-            state = py_game.initial_state()
-            # Make some moves
-            for _ in range(3):
-                action = py_game.legal_actions(state)[0]
-                state = py_game.next_state(state, action)
-
-            py_tensor = py_game.to_tensor(state)
-            rs_tensor = rs_game.to_tensor(state)
-            torch.testing.assert_close(py_tensor, rs_tensor)
+    def test_backend_is_rust(self, game):
+        """Game uses Rust backend."""
+        assert game.backend == 'rust'
 
 
 # ============================================================================
@@ -536,46 +412,41 @@ class TestGetGame:
 
     def test_get_tictactoe(self):
         """Can get TicTacToe game."""
-        game = get_game('tictactoe', use_rust=False)
+        game = get_game('tictactoe')
         assert isinstance(game, TicTacToe)
+        assert game.backend == 'rust'
 
     def test_get_connect4(self):
         """Can get Connect4 game."""
-        game = get_game('connect4', use_rust=False)
+        game = get_game('connect4')
         assert isinstance(game, Connect4)
+        assert game.backend == 'rust'
 
     def test_get_go9x9(self):
         """Can get 9x9 Go game."""
-        game = get_game('go9x9', use_rust=False)
+        game = get_game('go9x9')
         assert isinstance(game, Go)
         assert game.height == 9
         assert game.width == 9
+        assert game.backend == 'rust'
 
     def test_get_go19x19(self):
         """Can get 19x19 Go game."""
-        game = get_game('go19x19', use_rust=False)
+        game = get_game('go19x19')
         assert isinstance(game, Go)
         assert game.height == 19
         assert game.width == 19
+        assert game.backend == 'rust'
 
     def test_unknown_game_raises(self):
         """Unknown game name raises ValueError."""
         with pytest.raises(ValueError, match="Unknown game"):
             get_game('unknown_game')
 
-    @pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extension not available")
-    def test_rust_preference(self):
-        """With use_rust=True and Rust available, uses Rust implementation."""
-        from nanozero.game import RustTicTacToeWrapper, RustConnect4Wrapper, RustGoWrapper
-
-        game = get_game('tictactoe', use_rust=True)
-        assert isinstance(game, RustTicTacToeWrapper)
-
-        game = get_game('connect4', use_rust=True)
-        assert isinstance(game, RustConnect4Wrapper)
-
-        game = get_game('go9x9', use_rust=True)
-        assert isinstance(game, RustGoWrapper)
+    def test_use_rust_param_ignored(self):
+        """use_rust parameter is accepted but ignored (always uses Rust)."""
+        game = get_game('tictactoe', use_rust=False)
+        assert game.backend == 'rust'
 
 
 if __name__ == '__main__':

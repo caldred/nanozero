@@ -103,10 +103,12 @@ impl GoState {
         }
     }
 
-    /// Maximum moves before game is declared a draw (2 * board_size²)
+    /// Maximum moves before game is declared a draw (3 * board_size²)
+    /// This is generous enough for untrained/random policies while preventing infinite games.
+    /// 9x9: 243 moves, 19x19: 1083 moves
     #[inline]
     pub fn max_moves(&self) -> u16 {
-        (self.height * self.width * 2) as u16
+        (self.height * self.width * 3) as u16
     }
 
     #[inline]

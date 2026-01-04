@@ -13,7 +13,8 @@ import torch.nn.functional as F
 
 from nanozero.game import get_game
 from nanozero.model import AlphaZeroTransformer
-from nanozero.mcts import BatchedMCTS, sample_action
+from nanozero.mcts import BatchedMCTS
+from nanozero.common import sample_action
 from nanozero.replay import ReplayBuffer
 from nanozero.config import get_game_config, get_model_config, MCTSConfig, TrainConfig
 from nanozero.common import get_device, set_seed, print0, save_checkpoint, load_checkpoint, AverageMeter

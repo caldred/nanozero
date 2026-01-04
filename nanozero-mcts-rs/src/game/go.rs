@@ -823,11 +823,11 @@ mod tests {
     #[test]
     fn test_move_limit_draw() {
         // Use a tiny 3x3 board to test move limit quickly
-        // max_moves = 3 * 3 * 2 = 18
+        // max_moves = 3 * 3 * 3 = 27
         let game = Go::new(3);
         let mut state = game.initial_state();
         let max_moves = state.as_go().max_moves();
-        assert_eq!(max_moves, 18);
+        assert_eq!(max_moves, 27);
 
         // Play moves until we hit the limit
         for i in 0..max_moves {

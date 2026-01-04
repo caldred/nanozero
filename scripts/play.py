@@ -10,7 +10,8 @@ import torch
 
 from nanozero.game import get_game
 from nanozero.model import AlphaZeroTransformer
-from nanozero.mcts import BatchedMCTS, sample_action
+from nanozero.mcts import BatchedMCTS
+from nanozero.common import sample_action
 from nanozero.config import get_model_config, MCTSConfig
 from nanozero.common import get_device, load_checkpoint
 
