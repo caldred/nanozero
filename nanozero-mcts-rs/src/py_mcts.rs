@@ -224,11 +224,12 @@ impl PyBatchedMCTS {
 
         // Determine leaves per batch:
         // - If user specified > 0, use that
-        // - Otherwise, use num_states (one leaf per game per batch)
+        // - Otherwise, use num_states * 8 (8 leaves per game per batch)
+        // Higher batching reduces NN callback overhead significantly
         let leaves_per_batch = if self.leaves_per_batch > 0 {
             self.leaves_per_batch as usize
         } else {
-            num_states
+            num_states * 8
         };
 
         // Run simulations with virtual loss batching

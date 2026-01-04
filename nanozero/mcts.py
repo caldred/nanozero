@@ -867,7 +867,7 @@ class RustBatchedMCTS:
             game: Game instance
             config: MCTS configuration
             virtual_loss: Virtual loss value for penalizing in-flight paths
-            leaves_per_batch: Number of leaves to collect per NN call (0 = auto = batch_size)
+            leaves_per_batch: Number of leaves to collect per NN call (0 = auto = batch_size * 8)
             use_transposition_table: Whether to cache NN evaluations (not used in Rust impl)
         """
         if not HAS_RUST_MCTS:
