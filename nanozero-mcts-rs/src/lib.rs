@@ -8,6 +8,7 @@ pub mod bayesian_search;
 pub mod game;
 pub mod math;
 pub mod node;
+pub mod py_mcts;
 pub mod search;
 pub mod tree;
 pub mod ucb;
@@ -115,7 +116,7 @@ impl PyTicTacToe {
     }
 
     fn board_size(&self) -> (usize, usize) {
-        self.game.board_size()
+        self.game.board_dims()
     }
 
     fn render(&self, state: PyReadonlyArray1<i8>) -> String {
@@ -219,7 +220,7 @@ impl PyConnect4 {
     }
 
     fn board_size(&self) -> (usize, usize) {
-        self.game.board_size()
+        self.game.board_dims()
     }
 
     fn render(&self, state: PyReadonlyArray1<i8>) -> String {
@@ -338,7 +339,7 @@ impl PyGo {
     }
 
     fn board_size(&self) -> (usize, usize) {
-        self.game.board_size()
+        self.game.board_dims()
     }
 
     fn render(&self, state: PyReadonlyArray2<i8>) -> String {
@@ -408,6 +409,11 @@ fn nanozero_mcts_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTicTacToe>()?;
     m.add_class::<PyConnect4>()?;
     m.add_class::<PyGo>()?;
+
+    // MCTS
+    m.add_class::<py_mcts::PyBatchedMCTS>()?;
+    m.add_class::<py_mcts::PyLeafInfo>()?;
+    m.add_class::<py_mcts::PySelectResult>()?;
 
     // Version info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

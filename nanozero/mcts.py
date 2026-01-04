@@ -838,3 +838,133 @@ def sample_action(probs: np.ndarray, temperature: float = 1.0) -> int:
 
     # Sample from distribution
     return int(np.random.choice(len(probs), p=probs))
+
+
+# Try to import Rust MCTS backend
+try:
+    from nanozero_mcts_rs import RustBatchedMCTS as _RustBatchedMCTS
+    HAS_RUST_MCTS = True
+except ImportError:
+    HAS_RUST_MCTS = False
+    _RustBatchedMCTS = None
+
+
+class RustBatchedMCTS:
+    """
+    Batched MCTS using Rust backend for tree operations.
+
+    Drop-in replacement for BatchedMCTS that runs the entire MCTS search
+    in Rust, only calling back to Python for neural network inference.
+    This minimizes Python-Rust boundary crossings for maximum performance.
+    """
+
+    def __init__(self, game: Game, config: MCTSConfig, virtual_loss: float = 1.0,
+                 use_transposition_table: bool = True):
+        """
+        Initialize Rust-backed batched MCTS.
+
+        Args:
+            game: Game instance
+            config: MCTS configuration
+            virtual_loss: Virtual loss value (not used in current Rust impl)
+            use_transposition_table: Whether to cache NN evaluations (not used in Rust impl)
+        """
+        if not HAS_RUST_MCTS:
+            raise ImportError("Rust MCTS backend not available. Install with: "
+                            "cd nanozero-mcts-rs && maturin develop --release")
+
+        self.game = game
+        self.config = config
+        self._model = None
+        self._device = None
+
+        # Create Rust MCTS instance
+        self._rust_mcts = _RustBatchedMCTS(
+            c_puct=config.c_puct,
+            dirichlet_alpha=config.dirichlet_alpha,
+            dirichlet_epsilon=config.dirichlet_epsilon,
+            num_simulations=config.num_simulations,
+        )
+
+        # Determine which game-specific search method to use
+        game_name = type(game).__name__.lower()
+        if 'tictactoe' in game_name:
+            self._search_fn = self._rust_mcts.search_tictactoe
+        elif 'connect4' in game_name:
+            self._search_fn = self._rust_mcts.search_connect4
+        else:
+            raise ValueError(f"Rust MCTS does not support game: {game_name}")
+
+    def clear_cache(self):
+        """Clear any cached state. No-op for Rust MCTS."""
+        pass
+
+    def search(
+        self,
+        states: np.ndarray,
+        model: torch.nn.Module,
+        num_simulations: Optional[int] = None,
+        add_noise: bool = True,
+        batch_size: Optional[int] = None
+    ) -> np.ndarray:
+        """
+        Run batched MCTS on multiple states using Rust backend.
+
+        The entire search runs in Rust, only calling back to Python for
+        neural network inference. This minimizes boundary crossings.
+
+        Args:
+            states: Batch of game states (shape is game-defined)
+            model: Neural network for policy/value prediction
+            num_simulations: Number of MCTS simulations per state
+            add_noise: Whether to add Dirichlet noise at roots
+            batch_size: Not used (kept for API compatibility)
+
+        Returns:
+            Policy array of shape (B, action_size)
+        """
+        if num_simulations is None:
+            num_simulations = self.config.num_simulations
+
+        # Store model and device for callback
+        self._model = model
+        self._device = next(model.parameters()).device
+
+        # Flatten states for Rust: (batch, h, w) -> (batch, h*w)
+        batch_size = states.shape[0]
+        flat_states = states.reshape(batch_size, -1)
+        flat_states = np.ascontiguousarray(flat_states, dtype=np.int8)
+
+        # Run search in Rust with callback to Python for NN inference
+        policies = self._search_fn(
+            flat_states,
+            self._nn_callback,
+            num_simulations=num_simulations,
+            add_noise=add_noise
+        )
+
+        return np.array(policies)
+
+    def _nn_callback(self, states: np.ndarray, legal_masks: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Callback for Rust MCTS to get neural network predictions.
+
+        Args:
+            states: Batch of state tensors (already canonical, mapped to 0,1,2)
+            legal_masks: Batch of legal action masks
+
+        Returns:
+            Tuple of (policies, values) as numpy arrays
+        """
+        # Convert to torch tensors
+        state_tensors = torch.from_numpy(states).long().to(self._device)
+        action_masks = torch.from_numpy(legal_masks).float().to(self._device)
+
+        # Get predictions
+        with torch.inference_mode():
+            pred_policies, pred_values = self._model.predict(state_tensors, action_masks)
+
+        policies = pred_policies.cpu().numpy().astype(np.float32)
+        values = pred_values.cpu().numpy().flatten().astype(np.float32)
+
+        return policies, values

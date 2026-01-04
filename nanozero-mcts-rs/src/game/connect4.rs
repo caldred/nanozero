@@ -201,8 +201,20 @@ impl Game for Connect4 {
         Connect4State::WIDTH
     }
 
-    fn board_size(&self) -> (usize, usize) {
+    fn board_size(&self) -> usize {
+        Connect4State::HEIGHT * Connect4State::WIDTH
+    }
+
+    fn board_dims(&self) -> (usize, usize) {
         (Connect4State::HEIGHT, Connect4State::WIDTH)
+    }
+
+    fn state_from_slice(&self, data: &[i8]) -> GameState {
+        let mut state = Connect4State::new();
+        for (i, &v) in data.iter().take(42).enumerate() {
+            state.board[i] = v;
+        }
+        GameState::Connect4(state)
     }
 
     fn render(&self, state: &GameState) -> String {

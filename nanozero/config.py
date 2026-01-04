@@ -54,17 +54,14 @@ class BayesianMCTSConfig:
     num_simulations: int = 1000
 
     # Bayesian prior hyperparameters
-    sigma_0: float = 0.5          # Prior std for logit-shifted initialization
-    obs_var: float = 0.25         # Observation variance (NN value uncertainty)
+    sigma_0: float = 1.0          # Prior std for logit-shifted initialization
+    obs_var: float = 1.0          # Observation variance (NN value uncertainty)
 
     # IDS hyperparameters
     ids_alpha: float = 0.0        # Pseudocount for IDS allocation
 
     # Variance aggregation
     prune_threshold: float = 0.01  # Soft-prune children with P(optimal) < threshold
-    optimality_weight: float = 0.3  # Base blend: 0=visit-proportional, 1=pure optimality
-    adaptive_weight: bool = True   # If True, increase optimality_weight as visits grow
-    visit_scale: float = 50.0      # Visits at which adaptive weight reaches ~0.86 of max
 
     # Early stopping
     early_stopping: bool = True   # Whether to stop when confident about best action

@@ -66,8 +66,14 @@ pub trait Game: Send + Sync {
     /// Get the number of possible actions.
     fn action_size(&self) -> usize;
 
-    /// Get the board size (for display/debugging).
-    fn board_size(&self) -> (usize, usize);
+    /// Get the total board size (number of cells).
+    fn board_size(&self) -> usize;
+
+    /// Get the board dimensions (height, width) for display.
+    fn board_dims(&self) -> (usize, usize);
+
+    /// Create a game state from a slice of i8 values.
+    fn state_from_slice(&self, data: &[i8]) -> GameState;
 
     /// Render the state as a string for debugging.
     fn render(&self, state: &GameState) -> String;

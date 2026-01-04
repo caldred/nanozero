@@ -507,8 +507,22 @@ impl Game for Go {
         self.action_size
     }
 
-    fn board_size(&self) -> (usize, usize) {
+    fn board_size(&self) -> usize {
+        self.height * self.width
+    }
+
+    fn board_dims(&self) -> (usize, usize) {
         (self.height, self.width)
+    }
+
+    fn state_from_slice(&self, data: &[i8]) -> GameState {
+        let mut state = GoState::new(self.height, self.width);
+        for (i, &v) in data.iter().take(self.height * self.width).enumerate() {
+            let row = i / self.width;
+            let col = i % self.width;
+            state.set(row, col, v);
+        }
+        GameState::Go(state)
     }
 
     fn render(&self, state: &GameState) -> String {

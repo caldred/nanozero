@@ -81,32 +81,23 @@ class BayesianNode:
         """Return precision (inverse variance) - proxy for visit count."""
         return 1.0 / self.sigma_sq
 
-    def aggregate_children(self, prune_threshold: float = 0.01, visited_only: bool = False,
-                           optimality_weight: float = 1.0, adaptive: bool = False,
-                           visit_scale: float = 50.0) -> None:
+    def aggregate_children(self, prune_threshold: float = 0.01, visited_only: bool = False) -> None:
         """
-        Compute aggregated belief from children.
+        Compute aggregated belief from children using optimality weights.
 
-        Uses a blend of optimality weights (probability each child is best) and
-        visit-proportional weights. Pure optimality weights can amplify neural
-        network errors; blending with visit weights makes backup more robust.
+        Weights children by P(child is optimal) computed via pairwise Gaussian
+        CDF comparisons. Children with very low optimality probability are pruned.
 
         Args:
             prune_threshold: Children with P(optimal) < threshold get weight 0
             visited_only: If True, only aggregate children that have been visited
-                         (visits > 0)
-            optimality_weight: Base blend factor. 0=visit-proportional, 1=pure optimality
-            adaptive: If True, increase blend towards optimality as visits grow
-            visit_scale: For adaptive mode, visits at which weight reaches ~0.86 of max
         """
         if not self.children:
             return
 
         if visited_only:
-            # Filter to only children that have been visited
             children = [c for c in self.children.values() if c.visits > 0]
             if not children:
-                # No visited children yet, don't update aggregate
                 return
         else:
             children = list(self.children.values())
@@ -114,7 +105,6 @@ class BayesianNode:
         n = len(children)
 
         if n == 1:
-            # Single child: aggregated belief is negated child belief
             child = children[0]
             self.agg_mu = -child.mu
             self.agg_sigma_sq = child.sigma_sq
@@ -136,11 +126,9 @@ class BayesianNode:
 
         for i in range(n):
             if i == leader_idx:
-                # P(leader > challenger)
                 diff = mu_L - mu_C
                 std = math.sqrt(sigma_sq_L + sigma_sq_C)
             else:
-                # P(child > leader)
                 diff = mus[i] - mu_L
                 std = math.sqrt(sigma_sqs[i] + sigma_sq_L)
 
@@ -149,40 +137,18 @@ class BayesianNode:
             else:
                 scores[i] = 1.0 if diff > 0 else 0.0
 
-        # Soft prune and normalize to get optimality weights
+        # Soft prune and normalize
         scores[scores < prune_threshold] = 0.0
         total = scores.sum()
         if total < 1e-10:
-            # Fallback: uniform weights
-            opt_weights = np.ones(n) / n
+            weights = np.ones(n) / n
         else:
-            opt_weights = scores / total
-
-        # Compute visit-proportional weights
-        visits = np.array([c.visits for c in children], dtype=np.float32)
-        visit_total = visits.sum()
-        if visit_total < 1e-10:
-            visit_weights = np.ones(n) / n
-        else:
-            visit_weights = visits / visit_total
-
-        # Compute effective optimality weight (adaptive increases with visits)
-        if adaptive and visit_total > 0:
-            # Sigmoid-like growth: starts at base, approaches 1.0 as visits grow
-            # effective = base + (1 - base) * (1 - exp(-visits/scale))
-            growth = 1.0 - math.exp(-visit_total / visit_scale)
-            effective_opt_weight = optimality_weight + (1.0 - optimality_weight) * growth
-        else:
-            effective_opt_weight = optimality_weight
-
-        # Blend optimality and visit weights
-        weights = effective_opt_weight * opt_weights + (1 - effective_opt_weight) * visit_weights
+            weights = scores / total
 
         # Aggregated mean (weighted average of children)
         self.agg_mu = float(np.sum(weights * mus))
 
         # Aggregated variance (squared weights + disagreement term)
-        # Squared weights cause faster variance collapse, concentrating on best action
         disagreement = (mus - self.agg_mu) ** 2
         self.agg_sigma_sq = float(np.sum(weights ** 2 * (sigma_sqs + disagreement)))
 
@@ -474,10 +440,7 @@ class BayesianMCTS:
                 policy, value = cached
                 self._create_children_from_policy(node, state, policy, value)
                 # Initialize aggregated belief from children
-                node.aggregate_children(self.config.prune_threshold,
-                                        optimality_weight=self.config.optimality_weight,
-                                        adaptive=self.config.adaptive_weight,
-                                        visit_scale=self.config.visit_scale)
+                node.aggregate_children(self.config.prune_threshold)
                 return value
 
         # Get policy and value from network
@@ -498,10 +461,7 @@ class BayesianMCTS:
         # Create children with logit-shifted priors
         self._create_children_from_policy(node, state, policy, value)
         # Initialize aggregated belief from children
-        node.aggregate_children(self.config.prune_threshold,
-                                optimality_weight=self.config.optimality_weight,
-                                adaptive=self.config.adaptive_weight,
-                                visit_scale=self.config.visit_scale)
+        node.aggregate_children(self.config.prune_threshold)
 
         return value
 
@@ -588,10 +548,7 @@ class BayesianMCTS:
                 if cached is not None:
                     policy, value = cached
                     self._create_children_from_policy(node, state, policy, value)
-                    node.aggregate_children(self.config.prune_threshold,
-                                        optimality_weight=self.config.optimality_weight,
-                                        adaptive=self.config.adaptive_weight,
-                                        visit_scale=self.config.visit_scale)
+                    node.aggregate_children(self.config.prune_threshold)
                     results[i] = value
                     continue
 

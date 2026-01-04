@@ -201,8 +201,20 @@ impl Game for TicTacToe {
         9
     }
 
-    fn board_size(&self) -> (usize, usize) {
+    fn board_size(&self) -> usize {
+        9
+    }
+
+    fn board_dims(&self) -> (usize, usize) {
         (3, 3)
+    }
+
+    fn state_from_slice(&self, data: &[i8]) -> GameState {
+        let mut state = TicTacToeState::new();
+        for (i, &v) in data.iter().take(9).enumerate() {
+            state.board[i] = v;
+        }
+        GameState::TicTacToe(state)
     }
 
     fn render(&self, state: &GameState) -> String {
