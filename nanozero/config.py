@@ -62,6 +62,9 @@ class BayesianMCTSConfig:
 
     # Variance aggregation
     prune_threshold: float = 0.01  # Soft-prune children with P(optimal) < threshold
+    optimality_weight: float = 0.3  # Base blend: 0=visit-proportional, 1=pure optimality
+    adaptive_weight: bool = True   # If True, increase optimality_weight as visits grow
+    visit_scale: float = 50.0      # Visits at which adaptive weight reaches ~0.86 of max
 
     # Early stopping
     early_stopping: bool = True   # Whether to stop when confident about best action

@@ -93,22 +93,49 @@ impl BayesianTreeArena {
     }
 
     /// Update aggregated beliefs for a node from its children.
-    pub fn update_aggregated(&mut self, node_idx: u32, prune_threshold: f32) {
+    ///
+    /// If `visited_only` is true, only children with visits > 0
+    /// are included in the aggregation.
+    pub fn update_aggregated(
+        &mut self,
+        node_idx: u32,
+        prune_threshold: f32,
+        visited_only: bool,
+        optimality_weight: f32,
+        adaptive: bool,
+        visit_scale: f32,
+    ) {
         let children = self.get_children(node_idx);
         if children.is_empty() {
             return;
         }
 
         // Collect child beliefs from parent's perspective (negate child values)
-        let child_beliefs: Vec<(f32, f32)> = children
+        // Optionally filter to only visited children
+        let child_beliefs: Vec<(f32, f32, u32)> = children
             .iter()
-            .map(|c| {
+            .filter_map(|c| {
                 let child = self.get(c.node_idx);
-                (-child.mu, child.sigma_sq)
+                if visited_only && child.visits == 0 {
+                    None // Skip unvisited children
+                } else {
+                    Some((-child.mu, child.sigma_sq, child.visits))
+                }
             })
             .collect();
 
-        let (agg_mu, agg_sigma_sq) = aggregate_children(&child_beliefs, prune_threshold);
+        if child_beliefs.is_empty() {
+            // No visited children yet, don't update aggregate
+            return;
+        }
+
+        let (agg_mu, agg_sigma_sq) = aggregate_children(
+            &child_beliefs,
+            prune_threshold,
+            optimality_weight,
+            adaptive,
+            visit_scale,
+        );
 
         let node = self.get_mut(node_idx);
         node.agg_mu = Some(agg_mu);
@@ -216,43 +243,74 @@ pub fn select_child_thompson_ids<R: rand::Rng>(
     }
 }
 
-/// Bayesian backup with variance aggregation.
+/// Backup with posterior propagation (not Bayesian updates at each level).
 ///
-/// For each level (from leaf to root):
-/// 1. Update visited child with observed value and propagated variance
-/// 2. Recompute parent's aggregated belief from all children
-/// 3. Propagate parent's aggregated value AND variance up
+/// Only the leaf node receives a true Bayesian update with obs_var.
+/// Intermediate nodes just aggregate their children's posteriors and
+/// copy the aggregated belief to their own belief.
+///
+/// This prevents precision from compounding at each level, since we're
+/// propagating posteriors rather than treating aggregated values as
+/// new observations.
 pub fn bayesian_backup(
     arena: &mut BayesianTreeArena,
     path: &BayesianSearchPath,
     leaf_value: f32,
-    initial_obs_var: f32,
+    obs_var: f32,
     min_variance: f32,
     prune_threshold: f32,
+    optimality_weight: f32,
+    adaptive: bool,
+    visit_scale: f32,
 ) {
     if path.nodes.len() < 2 {
         return; // No backup needed for root-only path
     }
 
-    let mut value = leaf_value;
-    let mut obs_var = initial_obs_var;
-
     // Iterate from leaf to root (skip root for update, it has no parent)
-    for i in (1..path.nodes.len()).rev() {
+    for (iteration, i) in (1..path.nodes.len()).rev().enumerate() {
         let child_idx = path.nodes[i];
         let parent_idx = path.nodes[i - 1];
 
-        // Update child's belief
-        arena.get_mut(child_idx).update(value, obs_var, min_variance);
+        // Mark child as visited and increment visit count
+        arena.get_mut(child_idx).visits += 1;
 
-        // Recompute parent's aggregated belief
-        arena.update_aggregated(parent_idx, prune_threshold);
+        if iteration == 0 {
+            // First iteration: child is the leaf
+            let child = arena.get(child_idx);
+            if !child.expanded() {
+                // Terminal or unexpanded: do Bayesian update with observation
+                arena.get_mut(child_idx).update(leaf_value, obs_var, min_variance);
+            } else {
+                // Just expanded: its agg_mu/agg_sigma_sq were set during expansion
+                // Copy aggregated belief to own belief
+                let child = arena.get(child_idx);
+                if let (Some(agg_mu), Some(agg_sigma_sq)) = (child.agg_mu, child.agg_sigma_sq) {
+                    let child_mut = arena.get_mut(child_idx);
+                    child_mut.mu = agg_mu;
+                    child_mut.sigma_sq = agg_sigma_sq;
+                }
+            }
+        }
+        // else: child's mu/sigma_sq were updated in previous iteration
 
-        // Propagate aggregated value and variance up
+        // Aggregate parent's children (visited only)
+        arena.update_aggregated(
+            parent_idx,
+            prune_threshold,
+            true,
+            optimality_weight,
+            adaptive,
+            visit_scale,
+        );
+
+        // Copy aggregated belief to own belief (no Bayesian update!)
+        // This is what the grandparent will see when it aggregates
         let parent = arena.get(parent_idx);
         if let (Some(agg_mu), Some(agg_sigma_sq)) = (parent.agg_mu, parent.agg_sigma_sq) {
-            value = agg_mu;
-            obs_var = agg_sigma_sq;
+            let parent_mut = arena.get_mut(parent_idx);
+            parent_mut.mu = agg_mu;
+            parent_mut.sigma_sq = agg_sigma_sq;
         }
     }
 }
@@ -461,13 +519,14 @@ mod tests {
         path.push(0, child_idx);
 
         // Backup a positive value
-        bayesian_backup(&mut arena, &path, 1.0, 0.5, 1e-6, 0.01);
+        bayesian_backup(&mut arena, &path, 1.0, 0.5, 1e-6, 0.01, 0.3, true, 50.0);
 
-        // Child should have updated belief
+        // Child should have updated belief and visit count
         let child = arena.get(child_idx);
         assert!(child.mu > 0.0);
+        assert_eq!(child.visits, 1);
 
-        // Root should have aggregated belief
+        // Root should have aggregated belief (now only includes visited child)
         let root_node = arena.get(root);
         assert!(root_node.agg_mu.is_some());
     }

@@ -46,6 +46,9 @@ class BayesianNode:
         self.agg_mu: Optional[float] = None
         self.agg_sigma_sq: Optional[float] = None
 
+        # Explicit visit counter for debugging and visited-only filtering
+        self.visits: int = 0
+
     def expanded(self) -> bool:
         """Check if node has been expanded (has children)."""
         return len(self.children) > 0
@@ -78,23 +81,36 @@ class BayesianNode:
         """Return precision (inverse variance) - proxy for visit count."""
         return 1.0 / self.sigma_sq
 
-    def aggregate_children(self, prune_threshold: float = 0.01) -> None:
+    def aggregate_children(self, prune_threshold: float = 0.01, visited_only: bool = False,
+                           optimality_weight: float = 1.0, adaptive: bool = False,
+                           visit_scale: float = 50.0) -> None:
         """
-        Compute aggregated belief from all children.
+        Compute aggregated belief from children.
 
-        Uses optimality weights (probability each child is best) and
-        variance aggregation (ensemble effect + disagreement).
-
-        The aggregated belief represents the expected value of the best child,
-        with variance reflecting both estimation uncertainty and child disagreement.
+        Uses a blend of optimality weights (probability each child is best) and
+        visit-proportional weights. Pure optimality weights can amplify neural
+        network errors; blending with visit weights makes backup more robust.
 
         Args:
             prune_threshold: Children with P(optimal) < threshold get weight 0
+            visited_only: If True, only aggregate children that have been visited
+                         (visits > 0)
+            optimality_weight: Base blend factor. 0=visit-proportional, 1=pure optimality
+            adaptive: If True, increase blend towards optimality as visits grow
+            visit_scale: For adaptive mode, visits at which weight reaches ~0.86 of max
         """
         if not self.children:
             return
 
-        children = list(self.children.values())
+        if visited_only:
+            # Filter to only children that have been visited
+            children = [c for c in self.children.values() if c.visits > 0]
+            if not children:
+                # No visited children yet, don't update aggregate
+                return
+        else:
+            children = list(self.children.values())
+
         n = len(children)
 
         if n == 1:
@@ -133,22 +149,42 @@ class BayesianNode:
             else:
                 scores[i] = 1.0 if diff > 0 else 0.0
 
-        # Soft prune and normalize to get weights
+        # Soft prune and normalize to get optimality weights
         scores[scores < prune_threshold] = 0.0
         total = scores.sum()
         if total < 1e-10:
             # Fallback: uniform weights
-            weights = np.ones(n) / n
+            opt_weights = np.ones(n) / n
         else:
-            weights = scores / total
+            opt_weights = scores / total
+
+        # Compute visit-proportional weights
+        visits = np.array([c.visits for c in children], dtype=np.float32)
+        visit_total = visits.sum()
+        if visit_total < 1e-10:
+            visit_weights = np.ones(n) / n
+        else:
+            visit_weights = visits / visit_total
+
+        # Compute effective optimality weight (adaptive increases with visits)
+        if adaptive and visit_total > 0:
+            # Sigmoid-like growth: starts at base, approaches 1.0 as visits grow
+            # effective = base + (1 - base) * (1 - exp(-visits/scale))
+            growth = 1.0 - math.exp(-visit_total / visit_scale)
+            effective_opt_weight = optimality_weight + (1.0 - optimality_weight) * growth
+        else:
+            effective_opt_weight = optimality_weight
+
+        # Blend optimality and visit weights
+        weights = effective_opt_weight * opt_weights + (1 - effective_opt_weight) * visit_weights
 
         # Aggregated mean (weighted average of children)
         self.agg_mu = float(np.sum(weights * mus))
 
         # Aggregated variance (squared weights + disagreement term)
-        # This implements the ensemble effect: Σ²_parent = Σ w²_a [σ²_a + (μ_a - V_parent)²]
+        # Squared weights cause faster variance collapse, concentrating on best action
         disagreement = (mus - self.agg_mu) ** 2
-        self.agg_sigma_sq = float(np.sum(weights**2 * (sigma_sqs + disagreement)))
+        self.agg_sigma_sq = float(np.sum(weights ** 2 * (sigma_sqs + disagreement)))
 
 
 class BayesianMCTS:
@@ -438,7 +474,10 @@ class BayesianMCTS:
                 policy, value = cached
                 self._create_children_from_policy(node, state, policy, value)
                 # Initialize aggregated belief from children
-                node.aggregate_children(self.config.prune_threshold)
+                node.aggregate_children(self.config.prune_threshold,
+                                        optimality_weight=self.config.optimality_weight,
+                                        adaptive=self.config.adaptive_weight,
+                                        visit_scale=self.config.visit_scale)
                 return value
 
         # Get policy and value from network
@@ -459,7 +498,10 @@ class BayesianMCTS:
         # Create children with logit-shifted priors
         self._create_children_from_policy(node, state, policy, value)
         # Initialize aggregated belief from children
-        node.aggregate_children(self.config.prune_threshold)
+        node.aggregate_children(self.config.prune_threshold,
+                                optimality_weight=self.config.optimality_weight,
+                                adaptive=self.config.adaptive_weight,
+                                visit_scale=self.config.visit_scale)
 
         return value
 
@@ -546,7 +588,10 @@ class BayesianMCTS:
                 if cached is not None:
                     policy, value = cached
                     self._create_children_from_policy(node, state, policy, value)
-                    node.aggregate_children(self.config.prune_threshold)
+                    node.aggregate_children(self.config.prune_threshold,
+                                        optimality_weight=self.config.optimality_weight,
+                                        adaptive=self.config.adaptive_weight,
+                                        visit_scale=self.config.visit_scale)
                     results[i] = value
                     continue
 
@@ -604,7 +649,10 @@ class BayesianMCTS:
                     value = values[local_idx]
 
                 self._create_children_from_policy(node, state, policy, value)
-                node.aggregate_children(self.config.prune_threshold)
+                node.aggregate_children(self.config.prune_threshold,
+                                        optimality_weight=self.config.optimality_weight,
+                                        adaptive=self.config.adaptive_weight,
+                                        visit_scale=self.config.visit_scale)
                 results[idx] = value
 
         return results
@@ -672,7 +720,10 @@ class BayesianMCTS:
             policy, value = cache_hits[i]
             self._create_children_from_policy(root, states[i], policy, value)
             # Initialize aggregated belief from children
-            root.aggregate_children(self.config.prune_threshold)
+            root.aggregate_children(self.config.prune_threshold,
+                                    optimality_weight=self.config.optimality_weight,
+                                    adaptive=self.config.adaptive_weight,
+                                    visit_scale=self.config.visit_scale)
             all_values[i] = value
 
         return roots, all_values
@@ -730,37 +781,51 @@ class BayesianMCTS:
         leaf_value: float
     ) -> None:
         """
-        Bayesian backup with variance aggregation.
+        Backup with posterior propagation (not Bayesian updates at each level).
 
-        For each level (from leaf to root):
-        1. Update visited child with observed value and propagated variance
-        2. Recompute parent's aggregated belief from all children
-        3. Propagate parent's aggregated value AND variance up
+        Only the leaf node receives a true Bayesian update with obs_var.
+        Intermediate nodes just aggregate their children's posteriors and
+        copy the aggregated belief to their own belief.
 
-        The observation variance at each level comes from the aggregated
-        variance of the level below, representing subtree uncertainty.
+        This prevents precision from compounding at each level, since we're
+        propagating posteriors rather than treating aggregated values as
+        new observations.
 
         Args:
             search_path: List of (parent_node, action) pairs from root to leaf
             leaf_value: Value at the leaf (from leaf's perspective)
         """
-        value = leaf_value
-        obs_var = self.config.obs_var  # Initial variance for leaf observations
-
-        for parent, action in reversed(search_path):
+        for i, (parent, action) in enumerate(reversed(search_path)):
             child = parent.children[action]
 
-            # Update child's belief with observed value and variance
-            child.update(value, obs_var, self.config.min_variance)
+            # Mark child as visited and increment visit count
+            child.visits += 1
 
-            # Recompute parent's aggregated belief from all children
-            parent.aggregate_children(self.config.prune_threshold)
+            if i == 0:
+                # First iteration: child is the leaf
+                if not child.expanded():
+                    # Terminal or unexpanded: do Bayesian update with observation
+                    child.update(leaf_value, self.config.obs_var, self.config.min_variance)
+                else:
+                    # Just expanded: its agg_mu/agg_sigma_sq were set during expansion
+                    # Copy aggregated belief to own belief
+                    if child.agg_mu is not None:
+                        child.mu = child.agg_mu
+                        child.sigma_sq = child.agg_sigma_sq
+            # else: child's mu/sigma_sq were updated in previous iteration
 
-            # Propagate aggregated value AND variance up
-            # Note: agg_mu is already from parent's perspective (children are negated
-            # in aggregate_children), so no additional negation needed here
-            value = parent.agg_mu
-            obs_var = parent.agg_sigma_sq  # Use aggregated variance for next level
+            # Aggregate parent's children
+            # TODO: experiment with visited_only=False to include prior information
+            parent.aggregate_children(self.config.prune_threshold, visited_only=True,
+                                      optimality_weight=self.config.optimality_weight,
+                                      adaptive=self.config.adaptive_weight,
+                                      visit_scale=self.config.visit_scale)
+
+            # Copy aggregated belief to own belief (no Bayesian update!)
+            # This is what the grandparent will see when it aggregates
+            if parent.agg_mu is not None:
+                parent.mu = parent.agg_mu
+                parent.sigma_sq = parent.agg_sigma_sq
 
     def _get_policy(self, root: BayesianNode) -> np.ndarray:
         """
