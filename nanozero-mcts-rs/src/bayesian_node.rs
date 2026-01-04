@@ -24,6 +24,8 @@ pub struct BayesianNode {
     pub children_count: u16,
     /// Explicit visit counter
     pub visits: u32,
+    /// Virtual loss counter for parallel selection
+    pub virtual_loss: u8,
 }
 
 impl BayesianNode {
@@ -38,6 +40,7 @@ impl BayesianNode {
             children_start: 0,
             children_count: 0,
             visits: 0,
+            virtual_loss: 0,
         }
     }
 
@@ -58,6 +61,18 @@ impl BayesianNode {
         1.0 / self.sigma_sq.max(1e-8)
     }
 
+    /// Apply virtual loss (increment counter).
+    #[inline]
+    pub fn apply_virtual_loss(&mut self) {
+        self.virtual_loss = self.virtual_loss.saturating_add(1);
+    }
+
+    /// Remove virtual loss (decrement counter).
+    #[inline]
+    pub fn remove_virtual_loss(&mut self) {
+        self.virtual_loss = self.virtual_loss.saturating_sub(1);
+    }
+
     /// Bayesian update with an observed value.
     ///
     /// Uses precision-weighted combination:
@@ -76,6 +91,17 @@ impl BayesianNode {
     pub fn sample<R: rand::Rng>(&self, rng: &mut R) -> f32 {
         use rand_distr::{Distribution, Normal};
         let normal = Normal::new(self.mu, self.sigma_sq.sqrt()).unwrap();
+        normal.sample(rng)
+    }
+
+    /// Draw a Thompson sample with virtual loss adjustment.
+    ///
+    /// Virtual loss shifts mu to make in-flight paths look worse (higher child mu
+    /// = opponent winning = bad for parent when negated during selection).
+    pub fn sample_with_virtual_loss<R: rand::Rng>(&self, rng: &mut R, virtual_loss_value: f32) -> f32 {
+        use rand_distr::{Distribution, Normal};
+        let adjusted_mu = self.mu + (self.virtual_loss as f32 * virtual_loss_value);
+        let normal = Normal::new(adjusted_mu, self.sigma_sq.sqrt()).unwrap();
         normal.sample(rng)
     }
 }

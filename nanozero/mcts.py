@@ -985,7 +985,8 @@ class RustBayesianMCTS:
     """
 
     def __init__(self, game: Game, config, leaves_per_batch: int = 0,
-                 use_transposition_table: bool = True, seed: Optional[int] = None):
+                 virtual_loss: float = 1.0, use_transposition_table: bool = True,
+                 seed: Optional[int] = None):
         """
         Initialize Rust-backed Bayesian MCTS.
 
@@ -993,6 +994,7 @@ class RustBayesianMCTS:
             game: Game instance
             config: BayesianMCTSConfig configuration
             leaves_per_batch: Number of leaves to collect per NN call (0 = auto)
+            virtual_loss: Virtual loss value for penalizing in-flight paths (default 1.0)
             use_transposition_table: Whether to cache NN evaluations (not used in Rust)
             seed: Random seed for reproducibility
         """
@@ -1017,6 +1019,7 @@ class RustBayesianMCTS:
             min_simulations=config.min_simulations,
             min_variance=config.min_variance,
             leaves_per_batch=leaves_per_batch,
+            virtual_loss_value=virtual_loss,
             seed=seed,
         )
 

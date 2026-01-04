@@ -232,6 +232,72 @@ pub fn select_child_thompson_ids<R: rand::Rng>(
     }
 }
 
+/// Top-Two Thompson Sampling with IDS allocation and virtual loss.
+///
+/// Same as `select_child_thompson_ids` but uses virtual loss adjusted samples
+/// to discourage re-selecting in-flight paths.
+pub fn select_child_thompson_ids_with_virtual_loss<R: rand::Rng>(
+    arena: &BayesianTreeArena,
+    node_idx: u32,
+    ids_alpha: f32,
+    virtual_loss_value: f32,
+    rng: &mut R,
+) -> (u16, u32) {
+    let children = arena.get_children(node_idx);
+    debug_assert!(!children.is_empty());
+
+    if children.len() == 1 {
+        return (children[0].action, children[0].node_idx);
+    }
+
+    // Draw Thompson samples with virtual loss adjustment
+    // (from parent's perspective: negate child values)
+    let mut samples: Vec<(u16, u32, f32)> = children
+        .iter()
+        .map(|c| {
+            let child = arena.get(c.node_idx);
+            // Use virtual loss adjusted sample - higher adjusted mu = worse for parent
+            let sample = -child.sample_with_virtual_loss(rng, virtual_loss_value);
+            (c.action, c.node_idx, sample)
+        })
+        .collect();
+
+    // Sort by sample value (descending)
+    samples.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let (leader_action, leader_idx, _) = samples[0];
+    let (challenger_action, challenger_idx, _) = samples[1];
+
+    // IDS allocation probability
+    let leader_precision = arena.get(leader_idx).precision();
+    let challenger_precision = arena.get(challenger_idx).precision();
+
+    // beta = probability of selecting challenger
+    let beta = (leader_precision + ids_alpha)
+        / (leader_precision + challenger_precision + 2.0 * ids_alpha);
+
+    // Select challenger with probability beta
+    if rng.gen::<f32>() < beta {
+        (challenger_action, challenger_idx)
+    } else {
+        (leader_action, leader_idx)
+    }
+}
+
+/// Apply virtual loss to all nodes in a Bayesian search path.
+pub fn apply_bayesian_virtual_loss(arena: &mut BayesianTreeArena, path: &BayesianSearchPath) {
+    for &node_idx in path.nodes.iter() {
+        arena.get_mut(node_idx).apply_virtual_loss();
+    }
+}
+
+/// Remove virtual loss from all nodes in a Bayesian search path.
+pub fn remove_bayesian_virtual_loss(arena: &mut BayesianTreeArena, path: &BayesianSearchPath) {
+    for &node_idx in path.nodes.iter() {
+        arena.get_mut(node_idx).remove_virtual_loss();
+    }
+}
+
 /// Backup with posterior propagation (not Bayesian updates at each level).
 ///
 /// Only the leaf node receives a true Bayesian update with obs_var.
@@ -292,6 +358,56 @@ pub fn bayesian_backup(
 
         // Copy aggregated belief to own belief (no Bayesian update!)
         // This is what the grandparent will see when it aggregates
+        let parent = arena.get(parent_idx);
+        if let (Some(agg_mu), Some(agg_sigma_sq)) = (parent.agg_mu, parent.agg_sigma_sq) {
+            let parent_mut = arena.get_mut(parent_idx);
+            parent_mut.mu = agg_mu;
+            parent_mut.sigma_sq = agg_sigma_sq;
+        }
+    }
+}
+
+/// Backup with posterior propagation and virtual loss removal.
+///
+/// Same as `bayesian_backup` but also removes virtual loss from the path.
+pub fn bayesian_backup_with_virtual_loss_removal(
+    arena: &mut BayesianTreeArena,
+    path: &BayesianSearchPath,
+    leaf_value: f32,
+    obs_var: f32,
+    min_variance: f32,
+    prune_threshold: f32,
+) {
+    // First remove virtual loss from entire path
+    remove_bayesian_virtual_loss(arena, path);
+
+    // Then do normal backup
+    if path.nodes.len() < 2 {
+        return;
+    }
+
+    for (iteration, i) in (1..path.nodes.len()).rev().enumerate() {
+        let child_idx = path.nodes[i];
+        let parent_idx = path.nodes[i - 1];
+
+        arena.get_mut(child_idx).visits += 1;
+
+        if iteration == 0 {
+            let child = arena.get(child_idx);
+            if !child.expanded() {
+                arena.get_mut(child_idx).update(leaf_value, obs_var, min_variance);
+            } else {
+                let child = arena.get(child_idx);
+                if let (Some(agg_mu), Some(agg_sigma_sq)) = (child.agg_mu, child.agg_sigma_sq) {
+                    let child_mut = arena.get_mut(child_idx);
+                    child_mut.mu = agg_mu;
+                    child_mut.sigma_sq = agg_sigma_sq;
+                }
+            }
+        }
+
+        arena.update_aggregated(parent_idx, prune_threshold, true);
+
         let parent = arena.get(parent_idx);
         if let (Some(agg_mu), Some(agg_sigma_sq)) = (parent.agg_mu, parent.agg_sigma_sq) {
             let parent_mut = arena.get_mut(parent_idx);

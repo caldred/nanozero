@@ -5,8 +5,9 @@
 
 use crate::bayesian_node::create_bayesian_children;
 use crate::bayesian_search::{
-    bayesian_backup, get_bayesian_policy, select_child_thompson_ids, should_stop_early,
-    BayesianSearchPath, BayesianTreeArena,
+    apply_bayesian_virtual_loss, bayesian_backup_with_virtual_loss_removal, get_bayesian_policy,
+    select_child_thompson_ids_with_virtual_loss, should_stop_early, BayesianSearchPath,
+    BayesianTreeArena,
 };
 use crate::game::{Game, GameState};
 use crate::math::add_dirichlet_noise;
@@ -475,6 +476,8 @@ pub struct PyBayesianMCTS {
     min_variance: f32,
     /// Number of leaves to collect per NN call
     leaves_per_batch: u32,
+    /// Virtual loss value for parallel selection
+    virtual_loss_value: f32,
     /// Random number generator
     rng: rand::rngs::StdRng,
 }
@@ -494,6 +497,7 @@ impl PyBayesianMCTS {
     ///     min_simulations: Min sims before early stopping (default 10)
     ///     min_variance: Variance floor (default 1e-6)
     ///     leaves_per_batch: Leaves per NN call, 0 = auto (default 0)
+    ///     virtual_loss_value: Virtual loss penalty for parallel selection (default 1.0)
     ///     seed: Random seed (optional)
     #[new]
     #[pyo3(signature = (
@@ -507,6 +511,7 @@ impl PyBayesianMCTS {
         min_simulations=10,
         min_variance=1e-6,
         leaves_per_batch=0,
+        virtual_loss_value=1.0,
         seed=None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -521,6 +526,7 @@ impl PyBayesianMCTS {
         min_simulations: u32,
         min_variance: f32,
         leaves_per_batch: u32,
+        virtual_loss_value: f32,
         seed: Option<u64>,
     ) -> Self {
         let rng = match seed {
@@ -539,6 +545,7 @@ impl PyBayesianMCTS {
             min_simulations,
             min_variance,
             leaves_per_batch,
+            virtual_loss_value,
             rng,
         }
     }
@@ -678,7 +685,7 @@ impl PyBayesianMCTS {
                         break;
                     }
 
-                    let arena = &arenas[state_idx];
+                    let arena = &mut arenas[state_idx];
                     let root_idx = 0u32;
                     let mut path = BayesianSearchPath::from_root(root_idx);
                     let mut node_idx = root_idx;
@@ -689,6 +696,8 @@ impl PyBayesianMCTS {
                         // Check if current state is terminal
                         if game.is_terminal(&current_state) {
                             let value = game.terminal_reward(&current_state);
+                            // Apply virtual loss before storing (will be removed during backup)
+                            apply_bayesian_virtual_loss(arena, &path);
                             terminal_backups.push((state_idx, path.clone(), value));
                             break;
                         }
@@ -697,15 +706,18 @@ impl PyBayesianMCTS {
 
                         // Check if needs expansion
                         if !node.expanded() {
+                            // Apply virtual loss to path before storing
+                            apply_bayesian_virtual_loss(arena, &path);
                             leaves_to_expand.push((state_idx, path, current_state));
                             break;
                         }
 
-                        // Select using Thompson sampling with IDS
-                        let (action, child_idx) = select_child_thompson_ids(
+                        // Select using Thompson sampling with IDS and virtual loss
+                        let (action, child_idx) = select_child_thompson_ids_with_virtual_loss(
                             arena,
                             node_idx,
                             self.ids_alpha,
+                            self.virtual_loss_value,
                             &mut self.rng,
                         );
                         path.push(action, child_idx);
@@ -718,18 +730,15 @@ impl PyBayesianMCTS {
                 attempts += 1;
             }
 
-            // Backup terminal leaves immediately
+            // Backup terminal leaves immediately (also removes virtual loss)
             for (state_idx, path, value) in terminal_backups.drain(..) {
-                bayesian_backup(
+                bayesian_backup_with_virtual_loss_removal(
                     &mut arenas[state_idx],
                     &path,
                     value,
                     self.obs_var,
                     self.min_variance,
                     self.prune_threshold,
-                    0.0,   // optimality_weight (unused)
-                    false, // adaptive (unused)
-                    0.0,   // visit_scale (unused)
                 );
                 sims_completed += 1;
             }
@@ -774,17 +783,14 @@ impl PyBayesianMCTS {
                     // Initialize aggregated belief for the expanded node
                     arena.update_aggregated(leaf_idx, self.prune_threshold, false);
 
-                    // Backup
-                    bayesian_backup(
+                    // Backup (also removes virtual loss)
+                    bayesian_backup_with_virtual_loss_removal(
                         arena,
                         path,
                         value,
                         self.obs_var,
                         self.min_variance,
                         self.prune_threshold,
-                        0.0,
-                        false,
-                        0.0,
                     );
                     sims_completed += 1;
                 }
@@ -927,6 +933,7 @@ mod tests {
             10,    // min_simulations
             1e-6,  // min_variance
             0,     // leaves_per_batch
+            1.0,   // virtual_loss_value
             Some(42),
         );
         assert_eq!(mcts.num_simulations, 1000);
