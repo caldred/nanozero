@@ -127,6 +127,26 @@ impl PyBatchedMCTS {
 
         self.search_internal(py, states, nn_callback, num_sims, add_noise, &game)
     }
+
+    /// Run MCTS search on a batch of Go states.
+    ///
+    /// States should be flattened Go boards with metadata appended.
+    /// For a 9x9 board: 81 board cells + 4 metadata = 85 elements per state.
+    #[pyo3(signature = (states, nn_callback, board_size=9, num_simulations=None, add_noise=true))]
+    fn search_go<'py>(
+        &mut self,
+        py: Python<'py>,
+        states: PyReadonlyArray2<i8>,
+        nn_callback: PyObject,
+        board_size: usize,
+        num_simulations: Option<u32>,
+        add_noise: bool,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let num_sims = num_simulations.unwrap_or(self.num_simulations);
+        let game = crate::game::Go::new(board_size);
+
+        self.search_internal(py, states, nn_callback, num_sims, add_noise, &game)
+    }
 }
 
 impl PyBatchedMCTS {
@@ -575,6 +595,21 @@ impl PyBayesianMCTS {
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let num_sims = num_simulations.unwrap_or(self.num_simulations);
         let game = crate::game::Connect4::new();
+        self.search_internal(py, states, nn_callback, num_sims, &game)
+    }
+
+    /// Run Bayesian MCTS on a batch of Go states.
+    #[pyo3(signature = (states, nn_callback, board_size=9, num_simulations=None))]
+    fn search_go<'py>(
+        &mut self,
+        py: Python<'py>,
+        states: PyReadonlyArray2<i8>,
+        nn_callback: PyObject,
+        board_size: usize,
+        num_simulations: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let num_sims = num_simulations.unwrap_or(self.num_simulations);
+        let game = crate::game::Go::new(board_size);
         self.search_internal(py, states, nn_callback, num_sims, &game)
     }
 }

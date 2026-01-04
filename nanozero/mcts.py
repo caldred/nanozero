@@ -865,10 +865,26 @@ class RustBatchedMCTS:
         game_name = type(game).__name__.lower()
         if 'tictactoe' in game_name:
             self._search_fn = self._rust_mcts.search_tictactoe
+            self._is_go = False
         elif 'connect4' in game_name:
             self._search_fn = self._rust_mcts.search_connect4
+            self._is_go = False
+        elif 'go' in game_name:
+            # Go requires board_size parameter
+            self._go_board_size = getattr(game, 'height', 9)
+            self._search_fn = self._search_go
+            self._is_go = True
         else:
             raise ValueError(f"Rust MCTS does not support game: {game_name}")
+
+    def _search_go(self, states, nn_callback, num_simulations=None, add_noise=True):
+        """Wrapper to call Rust search_go with board_size."""
+        return self._rust_mcts.search_go(
+            states, nn_callback,
+            board_size=self._go_board_size,
+            num_simulations=num_simulations,
+            add_noise=add_noise
+        )
 
     def clear_cache(self):
         """Clear any cached state. No-op for Rust MCTS."""
@@ -997,10 +1013,25 @@ class RustBayesianMCTS:
         game_name = type(game).__name__.lower()
         if 'tictactoe' in game_name:
             self._search_fn = self._rust_mcts.search_tictactoe
+            self._is_go = False
         elif 'connect4' in game_name:
             self._search_fn = self._rust_mcts.search_connect4
+            self._is_go = False
+        elif 'go' in game_name:
+            # Go requires board_size parameter
+            self._go_board_size = getattr(game, 'height', 9)
+            self._search_fn = self._search_go
+            self._is_go = True
         else:
             raise ValueError(f"Rust Bayesian MCTS does not support game: {game_name}")
+
+    def _search_go(self, states, nn_callback, num_simulations=None):
+        """Wrapper to call Rust search_go with board_size."""
+        return self._rust_mcts.search_go(
+            states, nn_callback,
+            board_size=self._go_board_size,
+            num_simulations=num_simulations
+        )
 
     def clear_cache(self):
         """Clear any cached state. No-op for Rust MCTS."""

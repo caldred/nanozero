@@ -517,11 +517,23 @@ impl Game for Go {
 
     fn state_from_slice(&self, data: &[i8]) -> GameState {
         let mut state = GoState::new(self.height, self.width);
-        for (i, &v) in data.iter().take(self.height * self.width).enumerate() {
+        let board_size = self.height * self.width;
+
+        // Copy board data
+        for (i, &v) in data.iter().take(board_size).enumerate() {
             let row = i / self.width;
             let col = i % self.width;
             state.set(row, col, v);
         }
+
+        // Parse metadata if present (flattened format includes extra row)
+        // Metadata starts at index board_size: [passes, ko_row, ko_col, turn]
+        if data.len() > board_size + 3 {
+            state.passes = data[board_size] as u8;
+            state.ko_point = (data[board_size + 1], data[board_size + 2]);
+            state.turn = data[board_size + 3] as u8;
+        }
+
         GameState::Go(state)
     }
 
