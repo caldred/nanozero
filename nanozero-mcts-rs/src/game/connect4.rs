@@ -242,6 +242,24 @@ impl Game for Connect4 {
         }
         result
     }
+
+    fn num_symmetries(&self) -> usize {
+        2 // Identity and horizontal flip
+    }
+
+    fn map_action(&self, action: u16, symmetry_idx: usize) -> u16 {
+        if symmetry_idx == 0 {
+            action // Identity
+        } else {
+            // Horizontal flip: column i -> column (WIDTH-1-i)
+            (Connect4State::WIDTH - 1 - action as usize) as u16
+        }
+    }
+
+    fn unmap_action(&self, action: u16, symmetry_idx: usize) -> u16 {
+        // Flip is self-inverse
+        self.map_action(action, symmetry_idx)
+    }
 }
 
 #[cfg(test)]

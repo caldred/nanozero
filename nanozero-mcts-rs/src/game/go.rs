@@ -719,6 +719,55 @@ impl Game for Go {
 
         result
     }
+
+    fn num_symmetries(&self) -> usize {
+        if self.height == self.width {
+            8 // 4 rotations × 2 (with/without flip)
+        } else {
+            1 // Non-square boards only have identity
+        }
+    }
+
+    fn map_action(&self, action: u16, symmetry_idx: usize) -> u16 {
+        if self.height != self.width || symmetry_idx == 0 {
+            return action;
+        }
+
+        // Symmetry indices: 0-3 are rotations (0, 2, 4, 6), 4-7 are flipped + rotations (1, 3, 5, 7)
+        // Even indices: just rotations (0, 1, 2, 3 rotations)
+        // Odd indices: flip then rotations
+        let rotations = symmetry_idx / 2;
+        let flipped = symmetry_idx % 2 == 1;
+
+        let mut a = action;
+        for _ in 0..rotations {
+            a = self.rotate_action(a);
+        }
+        if flipped {
+            a = self.flip_action(a);
+        }
+        a
+    }
+
+    fn unmap_action(&self, action: u16, symmetry_idx: usize) -> u16 {
+        if self.height != self.width || symmetry_idx == 0 {
+            return action;
+        }
+
+        let rotations = symmetry_idx / 2;
+        let flipped = symmetry_idx % 2 == 1;
+
+        let mut a = action;
+        // Undo flip first (flip is self-inverse)
+        if flipped {
+            a = self.flip_action(a);
+        }
+        // Undo rotation (rotate by 4 - rotations)
+        for _ in 0..((4 - rotations) % 4) {
+            a = self.rotate_action(a);
+        }
+        a
+    }
 }
 
 #[cfg(test)]

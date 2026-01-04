@@ -13,6 +13,9 @@ pub use go::Go;
 pub use state::GameState;
 pub use tictactoe::TicTacToe;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 /// Game trait defining the interface for all games.
 ///
 /// All methods take and return owned state to simplify the interface.
@@ -77,6 +80,51 @@ pub trait Game: Send + Sync {
 
     /// Render the state as a string for debugging.
     fn render(&self, state: &GameState) -> String;
+
+    /// Get the number of symmetries for this game.
+    fn num_symmetries(&self) -> usize {
+        // Default: just identity
+        1
+    }
+
+    /// Get symmetry index for the canonical form (smallest hash).
+    /// Returns (symmetry_index, hash) where symmetry_index can be used with
+    /// apply_symmetry and map_action.
+    fn canonical_symmetry_index(&self, state: &GameState) -> (usize, u64) {
+        // Generate a dummy policy to get symmetries
+        let policy = vec![0.0f32; self.action_size()];
+        let syms = self.symmetries(state, &policy);
+
+        let mut min_hash = u64::MAX;
+        let mut min_idx = 0;
+
+        for (idx, (sym_state, _)) in syms.iter().enumerate() {
+            let hash = compute_hash(sym_state);
+            if hash < min_hash {
+                min_hash = hash;
+                min_idx = idx;
+            }
+        }
+
+        (min_idx, min_hash)
+    }
+
+    /// Map an action through a symmetry transformation.
+    /// Given an action in the original space and a symmetry index,
+    /// returns the corresponding action in the transformed space.
+    fn map_action(&self, action: u16, symmetry_idx: usize) -> u16;
+
+    /// Inverse map: given an action in the transformed space and a symmetry index,
+    /// returns the corresponding action in the original space.
+    fn unmap_action(&self, action: u16, symmetry_idx: usize) -> u16;
+}
+
+/// Compute hash of a game state.
+#[inline]
+pub fn compute_hash(state: &GameState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    state.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Helper to check if a position is within bounds.

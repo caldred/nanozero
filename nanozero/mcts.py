@@ -38,13 +38,14 @@ class BatchedMCTS:
             config: MCTS configuration
             virtual_loss: Virtual loss value for penalizing in-flight paths
             leaves_per_batch: Number of leaves to collect per NN call (0 = auto)
-            use_transposition_table: Kept for API compatibility (not used in Rust impl)
+            use_transposition_table: Whether to use transposition table with symmetry support
         """
         self.game = game
         self.config = config
         self._model = None
         self._device = None
         self.backend = 'rust'
+        self._use_transposition_table = use_transposition_table
 
         # Create Rust MCTS instance with virtual loss batching
         self._rust_mcts = _RustBatchedMCTS(
@@ -54,6 +55,7 @@ class BatchedMCTS:
             num_simulations=config.num_simulations,
             leaves_per_batch=leaves_per_batch,
             virtual_loss_value=virtual_loss,
+            use_transposition_table=use_transposition_table,
         )
 
         # Determine which game-specific search method to use
@@ -81,8 +83,19 @@ class BatchedMCTS:
         )
 
     def clear_cache(self):
-        """Clear any cached state. No-op for Rust MCTS."""
-        pass
+        """Clear the transposition table.
+
+        Call this when the model is retrained to invalidate cached evaluations.
+        """
+        self._rust_mcts.clear_cache()
+
+    def cache_stats(self) -> Tuple[int, int, int]:
+        """Get transposition table statistics.
+
+        Returns:
+            Tuple of (hits, misses, num_entries)
+        """
+        return self._rust_mcts.cache_stats()
 
     def search(
         self,
@@ -175,7 +188,7 @@ class BayesianMCTS:
             config: BayesianMCTSConfig configuration
             leaves_per_batch: Number of leaves to collect per NN call (0 = auto)
             virtual_loss: Virtual loss value for penalizing in-flight paths
-            use_transposition_table: Kept for API compatibility (not used in Rust)
+            use_transposition_table: Whether to use transposition table with symmetry support
             seed: Random seed for reproducibility
         """
         self.game = game
@@ -183,6 +196,7 @@ class BayesianMCTS:
         self._model = None
         self._device = None
         self.backend = 'rust'
+        self._use_transposition_table = use_transposition_table
 
         # Create Rust Bayesian MCTS instance
         self._rust_mcts = _RustBayesianMCTS(
@@ -198,6 +212,7 @@ class BayesianMCTS:
             leaves_per_batch=leaves_per_batch,
             virtual_loss_value=virtual_loss,
             seed=seed,
+            use_transposition_table=use_transposition_table,
         )
 
         # Determine which game-specific search method to use
@@ -224,8 +239,19 @@ class BayesianMCTS:
         )
 
     def clear_cache(self):
-        """Clear any cached state. No-op for Rust MCTS."""
-        pass
+        """Clear the transposition table.
+
+        Call this when the model is retrained to invalidate cached evaluations.
+        """
+        self._rust_mcts.clear_cache()
+
+    def cache_stats(self) -> Tuple[int, int, int]:
+        """Get transposition table statistics.
+
+        Returns:
+            Tuple of (hits, misses, num_entries)
+        """
+        return self._rust_mcts.cache_stats()
 
     def search(
         self,

@@ -236,6 +236,40 @@ impl Game for TicTacToe {
         }
         result
     }
+
+    fn num_symmetries(&self) -> usize {
+        8 // 4 rotations × 2 (with/without flip)
+    }
+
+    fn map_action(&self, action: u16, symmetry_idx: usize) -> u16 {
+        // Symmetry indices: 0-3 are rotations, 4-7 are flipped + rotations
+        let rotations = symmetry_idx % 4;
+        let flipped = symmetry_idx >= 4;
+
+        let mut a = action as usize;
+        // Apply rotations
+        a = Self::rotate_action(a, rotations);
+        // Apply flip if needed
+        if flipped {
+            a = Self::flip_action(a);
+        }
+        a as u16
+    }
+
+    fn unmap_action(&self, action: u16, symmetry_idx: usize) -> u16 {
+        // Inverse of map_action: undo flip, then undo rotation
+        let rotations = symmetry_idx % 4;
+        let flipped = symmetry_idx >= 4;
+
+        let mut a = action as usize;
+        // Undo flip first (flip is self-inverse)
+        if flipped {
+            a = Self::flip_action(a);
+        }
+        // Undo rotation (rotate by 4 - rotations)
+        a = Self::rotate_action(a, (4 - rotations) % 4);
+        a as u16
+    }
 }
 
 #[cfg(test)]

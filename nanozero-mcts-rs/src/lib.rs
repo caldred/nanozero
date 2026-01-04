@@ -10,6 +10,7 @@ pub mod math;
 pub mod node;
 pub mod py_mcts;
 pub mod search;
+pub mod transposition_table;
 pub mod tree;
 pub mod ucb;
 

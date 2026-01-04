@@ -3,6 +3,8 @@
 //! Each game has its own compact state representation optimized for
 //! performance. The GameState enum provides a unified interface.
 
+use std::hash::{Hash, Hasher};
+
 /// Unified game state enum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GameState {
@@ -11,8 +13,19 @@ pub enum GameState {
     Go(GoState),
 }
 
+impl Hash for GameState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            GameState::TicTacToe(s) => s.hash(state),
+            GameState::Connect4(s) => s.hash(state),
+            GameState::Go(s) => s.hash(state),
+        }
+    }
+}
+
 /// TicTacToe state: 3x3 = 9 cells.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TicTacToeState {
     /// Board values: -1 (O), 0 (empty), 1 (X)
     pub board: [i8; 9],
@@ -41,7 +54,7 @@ impl Default for TicTacToeState {
 }
 
 /// Connect4 state: 6x7 = 42 cells.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Connect4State {
     /// Board values: -1 (O), 0 (empty), 1 (X)
     pub board: [i8; 42],
@@ -88,6 +101,19 @@ pub struct GoState {
     pub turn: u8,
     /// Move count for draw rule (game ends as draw after max_moves)
     pub move_count: u16,
+}
+
+// Custom Hash implementation that excludes move_count (training artifact, not game state)
+impl Hash for GoState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.board.hash(state);
+        self.height.hash(state);
+        self.width.hash(state);
+        self.passes.hash(state);
+        self.ko_point.hash(state);
+        self.turn.hash(state);
+        // Intentionally exclude move_count - it's for draw detection only
+    }
 }
 
 impl GoState {
