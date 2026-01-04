@@ -114,18 +114,24 @@ Both MCTS algorithms use a symmetry-aware transposition table to cache neural ne
 - **Respects symmetries**: symmetric positions (rotations, reflections) share cache entries
 - **Persists across searches** until explicitly cleared (typically when the model is retrained)
 
+**Important**: Disable TT during training to maximize diversity in self-play data:
+
 ```python
-# Enabled by default
-mcts = BatchedMCTS(game, config, use_transposition_table=True)
+# During TRAINING: disable TT for diverse self-play
+train_mcts = BatchedMCTS(game, config, use_transposition_table=False)
 
-# Run searches - cache fills automatically
-policies = mcts.search(states, model)
+# During EVALUATION/INFERENCE: enable TT for speed
+eval_mcts = BatchedMCTS(game, config, use_transposition_table=True)
+```
 
-# Check cache statistics
+When TT is enabled during training, symmetric positions share cached evaluations, reducing diversity and potentially causing the model to plateau or regress.
+
+```python
+# Check cache statistics (when TT is enabled)
 hits, misses, entries = mcts.cache_stats()
 print(f"Cache hit rate: {hits / (hits + misses):.1%}, entries: {entries}")
 
-# Clear when model is retrained (invalidates cached evaluations)
+# Clear cache if reusing MCTS instance after model update
 mcts.clear_cache()
 ```
 
