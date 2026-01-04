@@ -8,6 +8,7 @@ NanoZero combines a Transformer-based policy-value network with GPU-accelerated 
 
 **Key Features:**
 - **Rust MCTS backend** with virtual loss batching for parallel leaf evaluation
+- **Symmetry-aware transposition table** for caching NN evaluations across searches
 - **Two search algorithms**: PUCT (standard AlphaZero) and Bayesian MCTS (Thompson Sampling with IDS)
 - **Transformer architecture** that generalizes across board games
 - **Three games**: TicTacToe, Connect4, Go (9x9/19x19)
@@ -42,6 +43,7 @@ nanozero/
 │   └── src/
 │       ├── search.rs        # PUCT search with virtual loss
 │       ├── bayesian_search.rs  # Bayesian MCTS (TTTS + IDS)
+│       ├── transposition_table.rs  # Symmetry-aware position cache
 │       ├── game/            # Rust game implementations
 │       │   ├── tictactoe.rs
 │       │   ├── connect4.rs
@@ -103,6 +105,34 @@ mcts = BatchedMCTS(game, config, leaves_per_batch=64, virtual_loss=1.0)
 ```
 
 This dramatically improves GPU utilization by batching NN evaluations.
+
+## Transposition Table
+
+Both MCTS algorithms use a symmetry-aware transposition table to cache neural network evaluations:
+
+- **Caches policy/value outputs** to avoid redundant NN calls for previously seen positions
+- **Respects symmetries**: symmetric positions (rotations, reflections) share cache entries
+- **Persists across searches** until explicitly cleared (typically when the model is retrained)
+
+```python
+# Enabled by default
+mcts = BatchedMCTS(game, config, use_transposition_table=True)
+
+# Run searches - cache fills automatically
+policies = mcts.search(states, model)
+
+# Check cache statistics
+hits, misses, entries = mcts.cache_stats()
+print(f"Cache hit rate: {hits / (hits + misses):.1%}, entries: {entries}")
+
+# Clear when model is retrained (invalidates cached evaluations)
+mcts.clear_cache()
+```
+
+Symmetry-aware caching is particularly effective for games with many symmetries:
+- **TicTacToe**: 8 symmetries (4 rotations × 2 reflections)
+- **Connect4**: 2 symmetries (identity + horizontal flip)
+- **Go**: 8 symmetries for square boards
 
 ## Games
 
