@@ -2,10 +2,14 @@
 //!
 //! Variable board size (typically 9x9, 13x13, or 19x19), action_size = board_size + 1 (for pass),
 //! 8 symmetries for square boards.
+//!
+//! Optimized for MCTS performance with fast legality checking.
 
 use super::state::{GameState, GoState};
 use super::{in_bounds, Game};
-use std::collections::HashSet;
+
+/// Neighbor offsets for the 4 cardinal directions.
+const NEIGHBORS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 
 /// Go game with configurable board size.
 pub struct Go {
@@ -35,6 +39,7 @@ impl Go {
     }
 
     /// Convert action to (row, col) or None for pass.
+    #[inline]
     fn action_to_pos(&self, action: u16) -> Option<(usize, usize)> {
         let a = action as usize;
         if a >= self.height * self.width {
@@ -45,85 +50,129 @@ impl Go {
     }
 
     /// Convert (row, col) to action.
+    #[inline]
     fn pos_to_action(&self, row: usize, col: usize) -> u16 {
         (row * self.width + col) as u16
     }
 
     /// Get the pass action.
+    #[inline]
     fn pass_action(&self) -> u16 {
         (self.height * self.width) as u16
     }
 
+    /// Convert (row, col) to linear index.
+    #[inline]
+    fn pos_to_idx(&self, row: usize, col: usize) -> usize {
+        row * self.width + col
+    }
+
     /// Find all stones in the same group as the given position.
-    fn find_group(&self, state: &GoState, row: usize, col: usize) -> HashSet<(usize, usize)> {
+    /// Uses a reusable visited buffer passed in to avoid allocations.
+    fn find_group_fast(
+        &self,
+        state: &GoState,
+        row: usize,
+        col: usize,
+        group: &mut Vec<(usize, usize)>,
+        visited: &mut [bool],
+    ) {
+        group.clear();
         let color = state.get(row, col);
         if color == 0 {
-            return HashSet::new();
+            return;
         }
 
-        let mut group = HashSet::new();
-        let mut stack = vec![(row, col)];
+        let mut stack_len = 1;
+        let mut stack = [(row, col); 128]; // Fixed-size stack, sufficient for any reasonable board
+        visited[self.pos_to_idx(row, col)] = true;
 
-        while let Some((r, c)) = stack.pop() {
-            if group.contains(&(r, c)) {
-                continue;
-            }
-            if state.get(r, c) != color {
-                continue;
-            }
+        while stack_len > 0 {
+            stack_len -= 1;
+            let (r, c) = stack[stack_len];
+            group.push((r, c));
 
-            group.insert((r, c));
-
-            // Check neighbors
-            for (dr, dc) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+            for &(dr, dc) in &NEIGHBORS {
                 let nr = r as i32 + dr;
                 let nc = c as i32 + dc;
                 if in_bounds(nr, nc, self.height, self.width) {
                     let nr = nr as usize;
                     let nc = nc as usize;
-                    if state.get(nr, nc) == color && !group.contains(&(nr, nc)) {
-                        stack.push((nr, nc));
+                    let idx = self.pos_to_idx(nr, nc);
+                    if !visited[idx] && state.get(nr, nc) == color {
+                        visited[idx] = true;
+                        stack[stack_len] = (nr, nc);
+                        stack_len += 1;
                     }
                 }
             }
         }
-
-        group
     }
 
-    /// Count liberties of a group.
-    fn count_liberties(&self, state: &GoState, group: &HashSet<(usize, usize)>) -> usize {
-        let mut liberties = HashSet::new();
+    /// Check if a group has any liberties (fast early exit).
+    #[inline]
+    fn group_has_liberties(&self, state: &GoState, group: &[(usize, usize)]) -> bool {
+        for &(r, c) in group {
+            for &(dr, dc) in &NEIGHBORS {
+                let nr = r as i32 + dr;
+                let nc = c as i32 + dc;
+                if in_bounds(nr, nc, self.height, self.width) {
+                    if state.get(nr as usize, nc as usize) == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Count liberties of a group (only used for scoring, not hot path).
+    fn count_liberties_slow(&self, state: &GoState, group: &[(usize, usize)]) -> usize {
+        let mut liberty_set = vec![false; self.height * self.width];
+        let mut count = 0;
 
         for &(r, c) in group {
-            for (dr, dc) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+            for &(dr, dc) in &NEIGHBORS {
                 let nr = r as i32 + dr;
                 let nc = c as i32 + dc;
                 if in_bounds(nr, nc, self.height, self.width) {
                     let nr = nr as usize;
                     let nc = nc as usize;
-                    if state.get(nr, nc) == 0 {
-                        liberties.insert((nr, nc));
+                    let idx = self.pos_to_idx(nr, nc);
+                    if state.get(nr, nc) == 0 && !liberty_set[idx] {
+                        liberty_set[idx] = true;
+                        count += 1;
                     }
                 }
             }
         }
-
-        liberties.len()
+        count
     }
 
-    /// Remove captured stones and return the number removed.
-    fn remove_captured(&self, state: &mut GoState, player: i8) -> usize {
+    /// Remove captured opponent stones adjacent to (row, col) and return count.
+    /// Only checks groups that touch the placed stone - much faster than scanning entire board.
+    fn remove_captured_adjacent(&self, state: &mut GoState, row: usize, col: usize, player: i8) -> usize {
         let opponent = -player;
         let mut captured = 0;
+        let board_size = self.height * self.width;
+        let mut visited = vec![false; board_size];
+        let mut group = Vec::with_capacity(32);
 
-        for row in 0..self.height {
-            for col in 0..self.width {
-                if state.get(row, col) == opponent {
-                    let group = self.find_group(state, row, col);
-                    if self.count_liberties(state, &group) == 0 {
-                        for &(r, c) in &group {
-                            state.set(r, c, 0);
+        for &(dr, dc) in &NEIGHBORS {
+            let nr = row as i32 + dr;
+            let nc = col as i32 + dc;
+            if in_bounds(nr, nc, self.height, self.width) {
+                let nr = nr as usize;
+                let nc = nc as usize;
+                let idx = self.pos_to_idx(nr, nc);
+
+                // Only check opponent groups we haven't already processed
+                if state.get(nr, nc) == opponent && !visited[idx] {
+                    self.find_group_fast(state, nr, nc, &mut group, &mut visited);
+
+                    if !self.group_has_liberties(state, &group) {
+                        for &(gr, gc) in &group {
+                            state.set(gr, gc, 0);
                             captured += 1;
                         }
                     }
@@ -134,44 +183,110 @@ impl Go {
         captured
     }
 
-    /// Check if a move is suicide (would result in self-capture).
-    fn is_suicide(&self, state: &GoState, row: usize, col: usize, player: i8) -> bool {
-        // Place the stone temporarily
-        let mut temp = state.clone();
-        temp.set(row, col, player);
+    /// Fast check if placing a stone at (row, col) is legal (not suicide, not ko).
+    /// Avoids cloning state by using direct checks.
+    fn is_legal_move(&self, state: &GoState, row: usize, col: usize, player: i8) -> bool {
+        // Ko check is trivial
+        if state.ko_point == (row as i8, col as i8) {
+            return false;
+        }
 
-        // Check if any adjacent opponent groups are captured
         let opponent = -player;
-        let mut would_capture = false;
-        for (dr, dc) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+
+        // Fast check 1: If the position has an empty neighbor, it's definitely not suicide
+        for &(dr, dc) in &NEIGHBORS {
+            let nr = row as i32 + dr;
+            let nc = col as i32 + dc;
+            if in_bounds(nr, nc, self.height, self.width) {
+                if state.get(nr as usize, nc as usize) == 0 {
+                    return true; // Has liberty, definitely legal
+                }
+            }
+        }
+
+        // Fast check 2: Would this move capture any opponent stones?
+        // If so, it's legal (we gain liberties from the capture)
+        let board_size = self.height * self.width;
+        let mut visited = vec![false; board_size];
+        let mut group = Vec::with_capacity(32);
+
+        for &(dr, dc) in &NEIGHBORS {
             let nr = row as i32 + dr;
             let nc = col as i32 + dc;
             if in_bounds(nr, nc, self.height, self.width) {
                 let nr = nr as usize;
                 let nc = nc as usize;
-                if temp.get(nr, nc) == opponent {
-                    let group = self.find_group(&temp, nr, nc);
-                    if self.count_liberties(&temp, &group) == 0 {
-                        would_capture = true;
-                        break;
+                let idx = self.pos_to_idx(nr, nc);
+
+                if state.get(nr, nc) == opponent && !visited[idx] {
+                    self.find_group_fast(state, nr, nc, &mut group, &mut visited);
+
+                    // Check if this opponent group has exactly one liberty (the position we're placing)
+                    let mut liberties = 0;
+                    let mut only_liberty_is_target = true;
+                    'outer: for &(gr, gc) in &group {
+                        for &(gdr, gdc) in &NEIGHBORS {
+                            let gnr = gr as i32 + gdr;
+                            let gnc = gc as i32 + gdc;
+                            if in_bounds(gnr, gnc, self.height, self.width) {
+                                let gnr = gnr as usize;
+                                let gnc = gnc as usize;
+                                if state.get(gnr, gnc) == 0 {
+                                    if gnr != row || gnc != col {
+                                        only_liberty_is_target = false;
+                                        break 'outer;
+                                    }
+                                    liberties += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if liberties > 0 && only_liberty_is_target {
+                        return true; // Would capture, so legal
                     }
                 }
             }
         }
 
-        // If we would capture, it's not suicide
-        if would_capture {
-            return false;
+        // Check 3: Would connecting to friendly groups give us liberties?
+        // We need to check if any adjacent friendly group has >1 liberty
+        visited.fill(false);
+        for &(dr, dc) in &NEIGHBORS {
+            let nr = row as i32 + dr;
+            let nc = col as i32 + dc;
+            if in_bounds(nr, nc, self.height, self.width) {
+                let nr = nr as usize;
+                let nc = nc as usize;
+                let idx = self.pos_to_idx(nr, nc);
+
+                if state.get(nr, nc) == player && !visited[idx] {
+                    self.find_group_fast(state, nr, nc, &mut group, &mut visited);
+
+                    // Count liberties of this friendly group (excluding our target position)
+                    let mut other_liberties = 0;
+                    for &(gr, gc) in &group {
+                        for &(gdr, gdc) in &NEIGHBORS {
+                            let gnr = gr as i32 + gdr;
+                            let gnc = gc as i32 + gdc;
+                            if in_bounds(gnr, gnc, self.height, self.width) {
+                                let gnr = gnr as usize;
+                                let gnc = gnc as usize;
+                                if state.get(gnr, gnc) == 0 && (gnr != row || gnc != col) {
+                                    other_liberties += 1;
+                                    if other_liberties > 0 {
+                                        return true; // Friendly group has other liberties
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Check if our own group would have zero liberties
-        let our_group = self.find_group(&temp, row, col);
-        self.count_liberties(&temp, &our_group) == 0
-    }
-
-    /// Check if a move violates the ko rule.
-    fn is_ko(&self, state: &GoState, row: usize, col: usize) -> bool {
-        state.ko_point == (row as i8, col as i8)
+        // No liberties, no captures, no friendly groups with liberties = suicide
+        false
     }
 
     /// Score the game using area scoring (Chinese rules).
@@ -296,6 +411,7 @@ impl Go {
         }
         new_state.passes = state.passes;
         new_state.turn = state.turn;
+        new_state.move_count = state.move_count;
         if state.ko_point.0 >= 0 {
             let (kr, kc) = self.rotate_pos(state.ko_point.0 as usize, state.ko_point.1 as usize);
             new_state.ko_point = (kr as i8, kc as i8);
@@ -316,6 +432,7 @@ impl Go {
         }
         new_state.passes = state.passes;
         new_state.turn = state.turn;
+        new_state.move_count = state.move_count;
         if state.ko_point.0 >= 0 {
             let (kr, kc) = self.flip_pos(state.ko_point.0 as usize, state.ko_point.1 as usize);
             new_state.ko_point = (kr as i8, kc as i8);
@@ -338,16 +455,13 @@ impl Game for Go {
     fn legal_actions(&self, state: &GameState) -> Vec<u16> {
         let s = state.as_go();
         let player = s.current_player();
-        let mut actions = Vec::new();
+        let mut actions = Vec::with_capacity(self.action_size);
 
-        // Check board positions
+        // Check board positions using optimized legality check
         for row in 0..self.height {
             for col in 0..self.width {
-                if s.get(row, col) == 0 {
-                    // Check if legal (not suicide, not ko)
-                    if !self.is_suicide(s, row, col, player) && !self.is_ko(s, row, col) {
-                        actions.push(self.pos_to_action(row, col));
-                    }
+                if s.get(row, col) == 0 && self.is_legal_move(s, row, col, player) {
+                    actions.push(self.pos_to_action(row, col));
                 }
             }
         }
@@ -371,25 +485,29 @@ impl Game for Go {
             new_state.set(row, col, player);
             new_state.passes = 0;
 
-            // Remove captured stones
-            let captured = self.remove_captured(&mut new_state, player);
+            // Remove captured stones (only check adjacent groups)
+            let captured = self.remove_captured_adjacent(&mut new_state, row, col, player);
 
             // Check for ko (single stone capture that could be immediately recaptured)
             if captured == 1 {
-                // Find the captured position
-                for (dr, dc) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                // Find the captured position (empty neighbor)
+                for &(dr, dc) in &NEIGHBORS {
                     let nr = row as i32 + dr;
                     let nc = col as i32 + dc;
                     if in_bounds(nr, nc, self.height, self.width) {
                         let nr = nr as usize;
                         let nc = nc as usize;
                         if new_state.get(nr, nc) == 0 {
-                            // Check if playing there would recapture exactly our stone
-                            let our_group = self.find_group(&new_state, row, col);
-                            if our_group.len() == 1
-                                && self.count_liberties(&new_state, &our_group) == 1
-                            {
-                                new_state.ko_point = (nr as i8, nc as i8);
+                            // Check if our stone is a single stone with exactly one liberty
+                            let board_size = self.height * self.width;
+                            let mut visited = vec![false; board_size];
+                            let mut group = Vec::with_capacity(8);
+                            self.find_group_fast(&new_state, row, col, &mut group, &mut visited);
+                            if group.len() == 1 {
+                                let liberties = self.count_liberties_slow(&new_state, &group);
+                                if liberties == 1 {
+                                    new_state.ko_point = (nr as i8, nc as i8);
+                                }
                             }
                             break;
                         }
@@ -401,18 +519,27 @@ impl Game for Go {
             new_state.passes += 1;
         }
 
-        // Switch turn
+        // Switch turn and increment move count
         new_state.turn = 1 - new_state.turn;
+        new_state.move_count += 1;
 
         GameState::Go(new_state)
     }
 
     fn is_terminal(&self, state: &GameState) -> bool {
-        state.as_go().passes >= 2
+        let s = state.as_go();
+        // Game ends on two consecutive passes OR exceeding move limit
+        s.passes >= 2 || s.move_count >= s.max_moves()
     }
 
     fn terminal_reward(&self, state: &GameState) -> f32 {
         let s = state.as_go();
+
+        // If game ended due to move limit, it's a draw
+        if s.move_count >= s.max_moves() {
+            return 0.0;
+        }
+
         let score = self.score(s);
         let current = s.current_player();
 
@@ -451,6 +578,7 @@ impl Game for Go {
             new_state.passes = s.passes;
             new_state.ko_point = s.ko_point;
             new_state.turn = s.turn;
+            new_state.move_count = s.move_count;
             GameState::Go(new_state)
         }
     }
@@ -527,11 +655,17 @@ impl Game for Go {
         }
 
         // Parse metadata if present (flattened format includes extra row)
-        // Metadata starts at index board_size: [passes, ko_row, ko_col, turn]
+        // Metadata: [passes, ko_row, ko_col, turn, move_count_lo, move_count_hi]
         if data.len() > board_size + 3 {
             state.passes = data[board_size] as u8;
             state.ko_point = (data[board_size + 1], data[board_size + 2]);
             state.turn = data[board_size + 3] as u8;
+            // Parse move_count if present (for backward compatibility)
+            if data.len() > board_size + 5 {
+                let lo = data[board_size + 4] as u8 as u16;
+                let hi = data[board_size + 5] as u8 as u16;
+                state.move_count = lo | (hi << 8);
+            }
         }
 
         GameState::Go(state)
@@ -684,5 +818,31 @@ mod tests {
                 sum
             );
         }
+    }
+
+    #[test]
+    fn test_move_limit_draw() {
+        // Use a tiny 3x3 board to test move limit quickly
+        // max_moves = 3 * 3 * 2 = 18
+        let game = Go::new(3);
+        let mut state = game.initial_state();
+        let max_moves = state.as_go().max_moves();
+        assert_eq!(max_moves, 18);
+
+        // Play moves until we hit the limit
+        for i in 0..max_moves {
+            assert!(!game.is_terminal(&state), "Game ended early at move {}", i);
+            // Just pass alternately
+            state = game.next_state(&state, game.pass_action());
+            // Reset passes to prevent ending via double pass
+            if i < max_moves - 1 {
+                state.as_go_mut().passes = 0;
+            }
+        }
+
+        // Now should be terminal due to move limit
+        assert!(game.is_terminal(&state));
+        // Should be a draw
+        assert_eq!(game.terminal_reward(&state), 0.0);
     }
 }

@@ -86,6 +86,8 @@ pub struct GoState {
     pub ko_point: (i8, i8),
     /// Current player's turn: 0 = black (1), 1 = white (-1)
     pub turn: u8,
+    /// Move count for draw rule (game ends as draw after max_moves)
+    pub move_count: u16,
 }
 
 impl GoState {
@@ -97,7 +99,14 @@ impl GoState {
             passes: 0,
             ko_point: (-1, -1),
             turn: 0,
+            move_count: 0,
         }
+    }
+
+    /// Maximum moves before game is declared a draw (2 * board_size²)
+    #[inline]
+    pub fn max_moves(&self) -> u16 {
+        (self.height * self.width * 2) as u16
     }
 
     #[inline]

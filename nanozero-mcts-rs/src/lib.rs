@@ -260,11 +260,13 @@ impl PyGo {
                         data[row][col] = s.get(row, col);
                     }
                 }
-                // Metadata row
+                // Metadata row: [passes, ko_row, ko_col, turn, move_count_lo, move_count_hi]
                 data[self.height][0] = s.passes as i8;
                 data[self.height][1] = s.ko_point.0;
                 data[self.height][2] = s.ko_point.1;
                 data[self.height][3] = s.turn as i8;
+                data[self.height][4] = (s.move_count & 0xFF) as i8;
+                data[self.height][5] = ((s.move_count >> 8) & 0xFF) as i8;
 
                 let flat: Vec<i8> = data.into_iter().flatten().collect();
                 PyArray1::from_vec_bound(py, flat)
@@ -363,11 +365,14 @@ impl PyGo {
             }
         }
 
-        // Metadata
+        // Metadata: [passes, ko_row, ko_col, turn, move_count_lo, move_count_hi]
         let meta_row = height * width;
         go_state.passes = slice[meta_row] as u8;
         go_state.ko_point = (slice[meta_row + 1], slice[meta_row + 2]);
         go_state.turn = slice[meta_row + 3] as u8;
+        let lo = slice[meta_row + 4] as u8 as u16;
+        let hi = slice[meta_row + 5] as u8 as u16;
+        go_state.move_count = lo | (hi << 8);
 
         GameState::Go(go_state)
     }
@@ -385,12 +390,14 @@ impl PyGo {
             }
         }
 
-        // Metadata
+        // Metadata: [passes, ko_row, ko_col, turn, move_count_lo, move_count_hi]
         let meta_row = self.height * self.width;
         data[meta_row] = s.passes as i8;
         data[meta_row + 1] = s.ko_point.0;
         data[meta_row + 2] = s.ko_point.1;
         data[meta_row + 3] = s.turn as i8;
+        data[meta_row + 4] = (s.move_count & 0xFF) as i8;
+        data[meta_row + 5] = ((s.move_count >> 8) & 0xFF) as i8;
 
         PyArray1::from_vec_bound(py, data)
             .reshape([self.height + 1, self.width])
