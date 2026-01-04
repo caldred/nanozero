@@ -606,10 +606,7 @@ class BayesianMCTS:
                     value = values[local_idx]
 
                 self._create_children_from_policy(node, state, policy, value)
-                node.aggregate_children(self.config.prune_threshold,
-                                        optimality_weight=self.config.optimality_weight,
-                                        adaptive=self.config.adaptive_weight,
-                                        visit_scale=self.config.visit_scale)
+                node.aggregate_children(self.config.prune_threshold)
                 results[idx] = value
 
         return results
@@ -677,10 +674,7 @@ class BayesianMCTS:
             policy, value = cache_hits[i]
             self._create_children_from_policy(root, states[i], policy, value)
             # Initialize aggregated belief from children
-            root.aggregate_children(self.config.prune_threshold,
-                                    optimality_weight=self.config.optimality_weight,
-                                    adaptive=self.config.adaptive_weight,
-                                    visit_scale=self.config.visit_scale)
+            root.aggregate_children(self.config.prune_threshold)
             all_values[i] = value
 
         return roots, all_values
@@ -773,10 +767,7 @@ class BayesianMCTS:
 
             # Aggregate parent's children
             # TODO: experiment with visited_only=False to include prior information
-            parent.aggregate_children(self.config.prune_threshold, visited_only=True,
-                                      optimality_weight=self.config.optimality_weight,
-                                      adaptive=self.config.adaptive_weight,
-                                      visit_scale=self.config.visit_scale)
+            parent.aggregate_children(self.config.prune_threshold, visited_only=True)
 
             # Copy aggregated belief to own belief (no Bayesian update!)
             # This is what the grandparent will see when it aggregates

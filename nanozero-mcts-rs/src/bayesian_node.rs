@@ -88,25 +88,18 @@ impl Default for BayesianNode {
 
 /// Aggregate children beliefs into parent's aggregated belief.
 ///
-/// Uses a blend of optimality weights (probability each child is best) and
-/// visit-proportional weights. Pure optimality weights can amplify neural
-/// network errors; blending with visit weights makes backup more robust.
+/// Weights children by P(child is optimal) computed via pairwise Gaussian
+/// CDF comparisons. Children with very low optimality probability are pruned.
 ///
 /// # Arguments
-/// * `children` - Slice of (mu, sigma_sq, visits) for each child (mu from parent's perspective, i.e., negated)
+/// * `children` - Slice of (mu, sigma_sq) for each child (mu from parent's perspective)
 /// * `prune_threshold` - Children with P(optimal) < threshold get weight 0
-/// * `optimality_weight` - Base blend factor. 0=visit-proportional, 1=pure optimality
-/// * `adaptive` - If true, increase blend towards optimality as visits grow
-/// * `visit_scale` - For adaptive mode, visits at which weight reaches ~0.86 of max
 ///
 /// # Returns
 /// * `(agg_mu, agg_sigma_sq)` - Aggregated mean and variance
 pub fn aggregate_children(
-    children: &[(f32, f32, u32)],  // (mu, sigma_sq, visits)
+    children: &[(f32, f32)],  // (mu, sigma_sq)
     prune_threshold: f32,
-    optimality_weight: f32,
-    adaptive: bool,
-    visit_scale: f32,
 ) -> (f32, f32) {
     let n = children.len();
     if n == 0 {
@@ -127,20 +120,18 @@ pub fn aggregate_children(
     let leader_idx = sorted_indices[0];
     let challenger_idx = sorted_indices[1];
 
-    let (mu_l, sigma_sq_l, _) = children[leader_idx];
-    let (mu_c, sigma_sq_c, _) = children[challenger_idx];
+    let (mu_l, sigma_sq_l) = children[leader_idx];
+    let (mu_c, sigma_sq_c) = children[challenger_idx];
 
     // Compute optimality scores via pairwise Gaussian CDF comparisons
     let mut scores = vec![0.0f32; n];
 
     for i in 0..n {
-        let (mu_i, sigma_sq_i, _) = children[i];
+        let (mu_i, sigma_sq_i) = children[i];
 
         let (diff, combined_var) = if i == leader_idx {
-            // P(leader > challenger)
             (mu_l - mu_c, sigma_sq_l + sigma_sq_c)
         } else {
-            // P(child > leader)
             (mu_i - mu_l, sigma_sq_i + sigma_sq_l)
         };
 
@@ -154,7 +145,7 @@ pub fn aggregate_children(
         };
     }
 
-    // Soft prune and normalize to get optimality weights
+    // Soft prune and normalize
     for score in scores.iter_mut() {
         if *score < prune_threshold {
             *score = 0.0;
@@ -162,50 +153,24 @@ pub fn aggregate_children(
     }
 
     let total: f32 = scores.iter().sum();
-    let opt_weights: Vec<f32> = if total < 1e-10 {
+    let weights: Vec<f32> = if total < 1e-10 {
         vec![1.0 / n as f32; n]
     } else {
         scores.iter().map(|s| s / total).collect()
     };
 
-    // Compute visit-proportional weights
-    let visits: Vec<f32> = children.iter().map(|&(_, _, v)| v as f32).collect();
-    let visit_total: f32 = visits.iter().sum();
-    let visit_weights: Vec<f32> = if visit_total < 1e-10 {
-        vec![1.0 / n as f32; n]
-    } else {
-        visits.iter().map(|&v| v / visit_total).collect()
-    };
-
-    // Compute effective optimality weight (adaptive increases with visits)
-    let effective_opt_weight = if adaptive && visit_total > 0.0 {
-        // Sigmoid-like growth: starts at base, approaches 1.0 as visits grow
-        let growth = 1.0 - (-visit_total / visit_scale).exp();
-        optimality_weight + (1.0 - optimality_weight) * growth
-    } else {
-        optimality_weight
-    };
-
-    // Blend optimality and visit weights
-    let weights: Vec<f32> = opt_weights
-        .iter()
-        .zip(visit_weights.iter())
-        .map(|(&opt, &vis)| effective_opt_weight * opt + (1.0 - effective_opt_weight) * vis)
-        .collect();
-
-    // Aggregated mean (weighted average of children)
+    // Aggregated mean
     let agg_mu: f32 = weights
         .iter()
         .zip(children.iter())
-        .map(|(&w, &(mu, _, _))| w * mu)
+        .map(|(&w, &(mu, _))| w * mu)
         .sum();
 
-    // Aggregated variance: Σ w²_a [σ²_a + (μ_a - V_parent)²]
-    // Using squared weights (w²) for faster variance collapse
+    // Aggregated variance (squared weights + disagreement)
     let agg_sigma_sq: f32 = weights
         .iter()
         .zip(children.iter())
-        .map(|(&w, &(mu, sigma_sq, _))| {
+        .map(|(&w, &(mu, sigma_sq))| {
             let disagreement = (mu - agg_mu).powi(2);
             w * w * (sigma_sq + disagreement)
         })
@@ -276,8 +241,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_single_child() {
-        let children = vec![(0.5, 0.1, 1)];
-        let (mu, sigma_sq) = aggregate_children(&children, 0.01, 1.0, false, 50.0);
+        let children = vec![(0.5, 0.1)];
+        let (mu, sigma_sq) = aggregate_children(&children, 0.01);
         assert!((mu - 0.5).abs() < 1e-6);
         assert!((sigma_sq - 0.1).abs() < 1e-6);
     }
@@ -285,8 +250,8 @@ mod tests {
     #[test]
     fn test_aggregate_two_children() {
         // Leader clearly better
-        let children = vec![(0.8, 0.1, 5), (0.2, 0.1, 5)];
-        let (mu, sigma_sq) = aggregate_children(&children, 0.01, 1.0, false, 50.0);
+        let children = vec![(0.8, 0.1), (0.2, 0.1)];
+        let (mu, sigma_sq) = aggregate_children(&children, 0.01);
 
         // Should be close to leader's value
         assert!(mu > 0.5);
@@ -296,29 +261,11 @@ mod tests {
     #[test]
     fn test_aggregate_with_pruning() {
         // One child clearly dominates
-        let children = vec![(0.9, 0.01, 10), (0.1, 0.01, 10)];
-        let (mu, _) = aggregate_children(&children, 0.1, 1.0, false, 50.0);
+        let children = vec![(0.9, 0.01), (0.1, 0.01)];
+        let (mu, _) = aggregate_children(&children, 0.1);
 
         // With high pruning threshold, should be very close to leader
         assert!(mu > 0.8);
-    }
-
-    #[test]
-    fn test_aggregate_blended_weights() {
-        // Test that blending with visit weights works
-        let children = vec![(0.9, 0.1, 1), (0.1, 0.1, 9)];  // Leader has few visits
-
-        // Pure optimality: should favor leader (0.9)
-        let (mu_opt, _) = aggregate_children(&children, 0.01, 1.0, false, 50.0);
-        assert!(mu_opt > 0.5);
-
-        // Pure visit-proportional: should favor second child (more visits)
-        let (mu_visit, _) = aggregate_children(&children, 0.01, 0.0, false, 50.0);
-        assert!(mu_visit < 0.3);
-
-        // Blended: somewhere in between
-        let (mu_blend, _) = aggregate_children(&children, 0.01, 0.5, false, 50.0);
-        assert!(mu_blend > mu_visit && mu_blend < mu_opt);
     }
 
     #[test]

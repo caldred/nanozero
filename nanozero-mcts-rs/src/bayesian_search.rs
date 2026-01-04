@@ -101,9 +101,6 @@ impl BayesianTreeArena {
         node_idx: u32,
         prune_threshold: f32,
         visited_only: bool,
-        optimality_weight: f32,
-        adaptive: bool,
-        visit_scale: f32,
     ) {
         let children = self.get_children(node_idx);
         if children.is_empty() {
@@ -111,31 +108,23 @@ impl BayesianTreeArena {
         }
 
         // Collect child beliefs from parent's perspective (negate child values)
-        // Optionally filter to only visited children
-        let child_beliefs: Vec<(f32, f32, u32)> = children
+        let child_beliefs: Vec<(f32, f32)> = children
             .iter()
             .filter_map(|c| {
                 let child = self.get(c.node_idx);
                 if visited_only && child.visits == 0 {
-                    None // Skip unvisited children
+                    None
                 } else {
-                    Some((-child.mu, child.sigma_sq, child.visits))
+                    Some((-child.mu, child.sigma_sq))
                 }
             })
             .collect();
 
         if child_beliefs.is_empty() {
-            // No visited children yet, don't update aggregate
             return;
         }
 
-        let (agg_mu, agg_sigma_sq) = aggregate_children(
-            &child_beliefs,
-            prune_threshold,
-            optimality_weight,
-            adaptive,
-            visit_scale,
-        );
+        let (agg_mu, agg_sigma_sq) = aggregate_children(&child_beliefs, prune_threshold);
 
         let node = self.get_mut(node_idx);
         node.agg_mu = Some(agg_mu);
