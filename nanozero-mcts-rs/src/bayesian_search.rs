@@ -210,6 +210,33 @@ pub enum BayesianFinalPolicy {
     Consensus,
 }
 
+fn better_root_recommendation(candidate: &RootChildBelief, best: &RootChildBelief) -> bool {
+    const EPS: f32 = 1e-7;
+
+    if candidate.weight > best.weight + EPS {
+        return true;
+    }
+    if best.weight > candidate.weight + EPS {
+        return false;
+    }
+
+    if candidate.mu > best.mu + EPS {
+        return true;
+    }
+    if best.mu > candidate.mu + EPS {
+        return false;
+    }
+
+    if candidate.prior > best.prior + EPS {
+        return true;
+    }
+    if best.prior > candidate.prior + EPS {
+        return false;
+    }
+
+    candidate.action < best.action
+}
+
 /// Compute root optimality weights from child Gaussian beliefs.
 ///
 /// This is the single source of truth for the Bayesian root policy and
@@ -313,10 +340,12 @@ pub fn root_stop_decision(
 
     let recommended_action = beliefs
         .iter()
-        .max_by(|a, b| {
-            a.weight
-                .partial_cmp(&b.weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        .reduce(|best, candidate| {
+            if better_root_recommendation(candidate, best) {
+                candidate
+            } else {
+                best
+            }
         })
         .map(|b| b.action);
 
@@ -338,6 +367,7 @@ pub fn root_stop_decision(
             .mu
             .partial_cmp(&beliefs[a].mu)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| beliefs[a].action.cmp(&beliefs[b].action))
     });
 
     let leader = &beliefs[sorted_indices[0]];
@@ -807,6 +837,26 @@ mod tests {
         assert_eq!(weights.len(), 3);
         assert!((sum - 1.0).abs() < 1e-6);
         assert!(weights.iter().all(|w| actions.contains(&w.action)));
+    }
+
+    #[test]
+    fn test_root_decision_tie_breaks_recommended_action_deterministically() {
+        let mut arena = BayesianTreeArena::new(100);
+        let root = arena.new_root();
+
+        let actions = vec![0, 1, 2];
+        let params = vec![
+            (1.0 / 3.0, 0.0, 1.0),
+            (1.0 / 3.0, 0.0, 1.0),
+            (1.0 / 3.0, 0.0, 1.0),
+        ];
+        arena.add_children(root, &actions, &params);
+
+        let decision = root_stop_decision(&arena, root, 0.99, 0.0, 1.0);
+
+        assert_eq!(decision.recommended_action, Some(0));
+        assert_eq!(decision.leader_action, Some(0));
+        assert_eq!(decision.challenger_action, Some(1));
     }
 
     #[test]
