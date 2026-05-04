@@ -135,7 +135,41 @@ pub fn aggregate_children(
         return (children[0].0, children[0].1);
     }
 
-    // Find leader and challenger by mean
+    let weights = pairwise_optimality_weights(children, prune_threshold);
+
+    // Aggregated mean
+    let agg_mu: f32 = weights
+        .iter()
+        .zip(children.iter())
+        .map(|(&w, &(mu, _))| w * mu)
+        .sum();
+
+    // Aggregated variance (squared weights + disagreement)
+    let agg_sigma_sq: f32 = weights
+        .iter()
+        .zip(children.iter())
+        .map(|(&w, &(mu, sigma_sq))| {
+            let disagreement = (mu - agg_mu).powi(2);
+            w * w * (sigma_sq + disagreement)
+        })
+        .sum();
+
+    (agg_mu, agg_sigma_sq)
+}
+
+/// Approximate P(each child is optimal) using pairwise Gaussian CDF comparisons.
+pub fn pairwise_optimality_weights(
+    children: &[(f32, f32)],
+    prune_threshold: f32,
+) -> Vec<f32> {
+    let n = children.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![1.0];
+    }
+
     let mut sorted_indices: Vec<usize> = (0..n).collect();
     sorted_indices.sort_by(|&a, &b| {
         children[b]
@@ -179,30 +213,11 @@ pub fn aggregate_children(
     }
 
     let total: f32 = scores.iter().sum();
-    let weights: Vec<f32> = if total < 1e-10 {
+    if total < 1e-10 {
         vec![1.0 / n as f32; n]
     } else {
         scores.iter().map(|s| s / total).collect()
-    };
-
-    // Aggregated mean
-    let agg_mu: f32 = weights
-        .iter()
-        .zip(children.iter())
-        .map(|(&w, &(mu, _))| w * mu)
-        .sum();
-
-    // Aggregated variance (squared weights + disagreement)
-    let agg_sigma_sq: f32 = weights
-        .iter()
-        .zip(children.iter())
-        .map(|(&w, &(mu, sigma_sq))| {
-            let disagreement = (mu - agg_mu).powi(2);
-            w * w * (sigma_sq + disagreement)
-        })
-        .sum();
-
-    (agg_mu, agg_sigma_sq)
+    }
 }
 
 /// Create children with logit-shifted prior initialization.
@@ -314,6 +329,21 @@ mod tests {
         // Higher prior → less negative log → larger (log_prior + entropy) → more subtracted → lower mu
         // This means good moves (high prior) lead to positions worse for opponent (lower child mu)
         assert!(children[0].1 < children[2].1);
+    }
+
+    #[test]
+    fn test_logit_shifted_prior_is_value_consistent() {
+        let priors = vec![0.5, 0.3, 0.2];
+        let value = 0.25;
+        let children = create_bayesian_children(value, &priors, 1.0);
+
+        let expected_value: f32 = priors
+            .iter()
+            .zip(children.iter())
+            .map(|(&p, &(_, child_mu, _))| p * -child_mu)
+            .sum();
+
+        assert!((expected_value - value).abs() < 1e-5);
     }
 
     #[test]

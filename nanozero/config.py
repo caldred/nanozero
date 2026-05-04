@@ -59,13 +59,17 @@ class BayesianMCTSConfig:
 
     # IDS hyperparameters
     ids_alpha: float = 0.0        # Pseudocount for IDS allocation
+    ids_allocation: str = "precision"  # "precision" or "visits"
+    final_policy: str = "optimality"   # "optimality" or "consensus"
 
     # Variance aggregation
     prune_threshold: float = 0.01  # Soft-prune children with P(optimal) < threshold
 
     # Early stopping
     early_stopping: bool = True   # Whether to stop when confident about best action
-    confidence_threshold: float = 0.95  # P(leader is optimal) threshold for stopping
+    confidence_threshold: float = 0.99  # Geometric prior/search consensus threshold
+    epsilon_tie: float = 0.02  # Stop when top two actions are statistically tied (0 disables)
+    tie_sigma: float = 1.0     # Std multiplier for epsilon-tie gap
     min_simulations: int = 10     # Minimum simulations before early stopping
 
     # Numerical stability

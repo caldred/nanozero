@@ -45,6 +45,10 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
     states = [game.initial_state() for _ in range(n_parallel)]
     move_counts = [0] * n_parallel
     game_examples = [[] for _ in range(n_parallel)]
+    search_sims = []
+    search_consensus = []
+    search_tie_gaps = []
+    stop_reasons = {}
 
     while games_completed < num_games:
         # Find active (non-terminal) games
@@ -58,6 +62,12 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
 
         # BayesianMCTS search (no add_noise parameter - uses Thompson sampling)
         policies = mcts.search(active_states, model)
+        for stat in mcts.search_stats():
+            search_sims.append(stat["simulations_used"])
+            search_consensus.append(stat["consensus_score"])
+            search_tie_gaps.append(stat["tie_gap"])
+            reason = stat["stop_reason"]
+            stop_reasons[reason] = stop_reasons.get(reason, 0) + 1
 
         # Process each active game
         for idx, game_idx in enumerate(active_indices):
@@ -101,6 +111,14 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
 
                 if games_completed % 10 == 0:
                     print0(f"  Self-play: {games_completed}/{num_games} games")
+
+    if search_sims:
+        reasons = ", ".join(f"{k}:{v}" for k, v in sorted(stop_reasons.items()))
+        print0(
+            f"  Search stats: avg_sims={np.mean(search_sims):.1f}, "
+            f"avg_consensus={np.mean(search_consensus):.3f}, "
+            f"avg_tie_gap={np.mean(search_tie_gaps):.3f}, stops=({reasons})"
+        )
 
     return all_examples
 
@@ -217,6 +235,12 @@ def main():
                         help='Observation variance for NN value updates')
     parser.add_argument('--ids_alpha', type=float, default=0.5,
                         help='IDS pseudocount for exploration')
+    parser.add_argument('--ids_allocation', type=str, default='precision',
+                        choices=['precision', 'visits'],
+                        help='IDS allocation signal')
+    parser.add_argument('--final_policy', type=str, default='optimality',
+                        choices=['optimality', 'consensus'],
+                        help='Policy target returned by Bayesian search')
     parser.add_argument('--temperature_threshold', type=int, default=15,
                         help='Move number after which temperature is 0')
     parser.add_argument('--parallel_games', type=int, default=64,
@@ -227,8 +251,12 @@ def main():
                         help='Enable early stopping when confident')
     parser.add_argument('--no_early_stopping', action='store_false', dest='early_stopping',
                         help='Disable early stopping')
-    parser.add_argument('--confidence_threshold', type=float, default=0.95,
-                        help='Confidence threshold for early stopping')
+    parser.add_argument('--confidence_threshold', type=float, default=0.99,
+                        help='Geometric prior/search consensus threshold for early stopping')
+    parser.add_argument('--epsilon_tie', type=float, default=0.02,
+                        help='Stop when top two Bayesian root actions are within this tie gap (0 disables)')
+    parser.add_argument('--tie_sigma', type=float, default=1.0,
+                        help='Std multiplier for the epsilon-tie root stopping gap')
 
     # Checkpointing and evaluation
     parser.add_argument('--checkpoint_interval', type=int, default=10,
@@ -288,13 +316,19 @@ def main():
         sigma_0=args.sigma_0,
         obs_var=args.obs_var,
         ids_alpha=args.ids_alpha,
+        ids_allocation=args.ids_allocation,
+        final_policy=args.final_policy,
         early_stopping=args.early_stopping,
         confidence_threshold=args.confidence_threshold,
+        epsilon_tie=args.epsilon_tie,
+        tie_sigma=args.tie_sigma,
     )
     mcts = BayesianMCTS(game, mcts_config, leaves_per_batch=leaves_per_batch)
 
     print0(f"BayesianMCTS: {args.mcts_simulations} sims, sigma_0={args.sigma_0}, obs_var={args.obs_var}")
-    print0(f"  IDS alpha={args.ids_alpha}, early_stopping={args.early_stopping}")
+    print0(f"  IDS alpha={args.ids_alpha}, allocation={args.ids_allocation}, final_policy={args.final_policy}")
+    print0(f"  early_stopping={args.early_stopping}")
+    print0(f"  consensus={args.confidence_threshold}, epsilon_tie={args.epsilon_tie}, tie_sigma={args.tie_sigma}")
 
     # Create replay buffer
     buffer = ReplayBuffer(args.buffer_size)

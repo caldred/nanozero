@@ -90,10 +90,18 @@ config = BayesianMCTSConfig(
     sigma_0=0.5,        # Prior std
     obs_var=0.25,       # Observation variance
     ids_alpha=0.5,      # IDS exploration weight
+    ids_allocation="precision",  # or "visits" for allocation ablations
+    final_policy="optimality",   # or "consensus" for sqrt(prior * search)
+    confidence_threshold=0.99,  # Prior/search consensus stop
+    epsilon_tie=0.02,   # Stop on statistically indistinguishable top actions
 )
 mcts = BayesianMCTS(game, config, leaves_per_batch=64)
 policies = mcts.search(states, model)
+stats = mcts.search_stats()  # stop reason, sims used, consensus, tie gap
 ```
+
+The consensus stop uses `min(max_a normalize(sqrt(prior_a * w_a)), sum_a sqrt(prior_a * w_a))`,
+so low-overlap prior/search disagreement cannot trigger an early stop.
 
 ## Virtual Loss Batching
 

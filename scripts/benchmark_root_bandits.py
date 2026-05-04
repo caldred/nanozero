@@ -41,6 +41,8 @@ class RootBanditResult:
     prob_correct: float  # Over multiple trials
     simple_regret: float  # V*(best) - V*(recommended)
     pulls_to_confidence: Optional[float]
+    avg_pulls_used: float
+    stop_reasons: Dict[str, int]
 
 
 class UCBRootBandit:
@@ -120,13 +122,23 @@ class TTTSRootBandit:
         sigma_0: float = 1.0,
         obs_var: float = 0.5,
         alpha: float = 0.5,
-        min_var: float = 1e-6
+        min_var: float = 1e-6,
+        confidence_threshold: float = 0.99,
+        epsilon_tie: float = 0.02,
+        tie_sigma: float = 1.0,
+        ids_allocation: str = 'precision',
+        final_policy: str = 'optimality',
     ):
         self.n_actions = n_actions
         self.sigma_0 = sigma_0
         self.obs_var = obs_var
         self.alpha = alpha
         self.min_var = min_var
+        self.confidence_threshold = confidence_threshold
+        self.epsilon_tie = epsilon_tie
+        self.tie_sigma = tie_sigma
+        self.ids_allocation = ids_allocation
+        self.final_policy = final_policy
 
         # Initialize with logit-shifted priors
         self._init_beliefs(priors, root_value, legal_mask)
@@ -159,6 +171,7 @@ class TTTSRootBandit:
                 self.mu[a] = -np.inf  # Illegal action
 
         self.total_pulls = 0
+        self.counts = np.zeros(self.n_actions)
 
     def reset(self, priors: np.ndarray, root_value: float, legal_mask: np.ndarray):
         """Reset with new priors."""
@@ -181,12 +194,15 @@ class TTTSRootBandit:
         challenger = sorted_idx[1]
 
         # IDS allocation
-        precision_leader = 1.0 / max(self.sigma_sq[leader], self.min_var)
-        precision_challenger = 1.0 / max(self.sigma_sq[challenger], self.min_var)
+        if self.ids_allocation == 'visits':
+            signal_leader = self.counts[leader]
+            signal_challenger = self.counts[challenger]
+        else:
+            signal_leader = 1.0 / max(self.sigma_sq[leader], self.min_var)
+            signal_challenger = 1.0 / max(self.sigma_sq[challenger], self.min_var)
 
-        beta = (precision_leader + self.alpha) / (
-            precision_leader + precision_challenger + 2 * self.alpha
-        )
+        denom = signal_leader + signal_challenger + 2 * self.alpha
+        beta = (signal_leader + self.alpha) / denom if denom > 0 else 0.5
 
         if np.random.random() < beta:
             return int(challenger)
@@ -196,6 +212,7 @@ class TTTSRootBandit:
     def update(self, action: int, reward: float):
         """Bayesian update with observed reward."""
         self.total_pulls += 1
+        self.counts[action] += 1
 
         precision_prior = 1.0 / max(self.sigma_sq[action], self.min_var)
         precision_obs = 1.0 / max(self.obs_var, self.min_var)
@@ -216,6 +233,8 @@ class TTTSRootBandit:
             winner = np.argmax(samples)
             wins[winner] += 1
 
+        if self.final_policy == 'consensus':
+            return int(np.argmax(self.get_policy()))
         return int(np.argmax(wins))
 
     def get_policy(self, n_samples: int = 100) -> np.ndarray:
@@ -228,9 +247,89 @@ class TTTSRootBandit:
             winner = np.argmax(samples)
             wins[winner] += 1
 
+        if self.final_policy == 'consensus':
+            weights = self.optimality_weights()
+            legal_actions = np.where(self.legal_mask)[0]
+            prior_sum = self.priors[legal_actions].sum()
+            priors = np.zeros(self.n_actions)
+            if prior_sum > 0:
+                priors[legal_actions] = self.priors[legal_actions] / prior_sum
+            pooled = np.sqrt(np.maximum(priors, 0.0) * np.maximum(weights, 0.0))
+            if pooled.sum() > 0:
+                return pooled / pooled.sum()
         if wins.sum() > 0:
             return wins / wins.sum()
         return self.priors.copy()
+
+    def optimality_weights(self) -> np.ndarray:
+        """Compute pairwise Gaussian optimality weights over legal actions."""
+        weights = np.zeros(self.n_actions)
+        legal_actions = np.where(self.legal_mask)[0]
+
+        if len(legal_actions) == 0:
+            return weights
+        if len(legal_actions) == 1:
+            weights[legal_actions[0]] = 1.0
+            return weights
+
+        sorted_actions = legal_actions[np.argsort(self.mu[legal_actions])[::-1]]
+        leader = sorted_actions[0]
+        challenger = sorted_actions[1]
+
+        def normal_cdf(x: float) -> float:
+            return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+        scores = np.zeros(self.n_actions)
+        for action in legal_actions:
+            if action == leader:
+                diff = self.mu[leader] - self.mu[challenger]
+                var = self.sigma_sq[leader] + self.sigma_sq[challenger]
+            else:
+                diff = self.mu[action] - self.mu[leader]
+                var = self.sigma_sq[action] + self.sigma_sq[leader]
+            scores[action] = normal_cdf(diff / math.sqrt(max(var, self.min_var)))
+
+        total = scores[legal_actions].sum()
+        if total > 0:
+            weights[legal_actions] = scores[legal_actions] / total
+        else:
+            weights[legal_actions] = 1.0 / len(legal_actions)
+        return weights
+
+    def stop_decision(self) -> Tuple[bool, str, float, float]:
+        """Return Bayesian root stop decision and diagnostics."""
+        legal_actions = np.where(self.legal_mask)[0]
+        if len(legal_actions) == 0:
+            return True, 'terminal', 0.0, 0.0
+        if len(legal_actions) == 1:
+            return True, 'forced', 1.0, 0.0
+
+        weights = self.optimality_weights()
+        legal_priors = np.zeros(self.n_actions)
+        prior_sum = self.priors[legal_actions].sum()
+        if prior_sum > 0:
+            legal_priors[legal_actions] = self.priors[legal_actions] / prior_sum
+
+        pooled = np.sqrt(np.maximum(legal_priors, 0.0) * np.maximum(weights, 0.0))
+        if pooled.sum() > 0:
+            consensus_score = float(min(pooled.max() / pooled.sum(), pooled.sum()))
+        else:
+            consensus_score = 0.0
+
+        sorted_actions = legal_actions[np.argsort(self.mu[legal_actions])[::-1]]
+        leader = sorted_actions[0]
+        challenger = sorted_actions[1]
+        tie_gap = float(
+            abs(self.mu[leader] - self.mu[challenger])
+            + max(self.tie_sigma, 0.0)
+            * math.sqrt(self.sigma_sq[leader] + self.sigma_sq[challenger])
+        )
+
+        if consensus_score >= self.confidence_threshold:
+            return True, 'consensus', consensus_score, tie_gap
+        if self.epsilon_tie > 0.0 and tie_gap <= self.epsilon_tie:
+            return True, 'epsilon_tie', consensus_score, tie_gap
+        return False, 'budget', consensus_score, tie_gap
 
 
 class RootBanditEnv:
@@ -328,6 +427,11 @@ def evaluate_root_bandit(
     state: np.ndarray,
     n_pulls: int,
     n_trials: int = 50,
+    confidence_threshold: float = 0.99,
+    epsilon_tie: float = 0.02,
+    tie_sigma: float = 1.0,
+    ids_allocation: str = 'precision',
+    final_policy: str = 'optimality',
 ) -> Dict[str, RootBanditResult]:
     """
     Evaluate both algorithms on a root-level bandit problem.
@@ -337,6 +441,8 @@ def evaluate_root_bandit(
     for algo_name in ['UCB', 'TTTS-IDS']:
         correct_count = 0
         simple_regrets = []
+        pulls_used = []
+        stop_reasons: Dict[str, int] = {}
 
         for trial in range(n_trials):
             # Setup environment
@@ -349,14 +455,34 @@ def evaluate_root_bandit(
                 algo = UCBRootBandit(env.game.config.action_size, priors, legal_mask)
             else:
                 algo = TTTSRootBandit(
-                    env.game.config.action_size, priors, root_value, legal_mask
+                    env.game.config.action_size,
+                    priors,
+                    root_value,
+                    legal_mask,
+                    confidence_threshold=confidence_threshold,
+                    epsilon_tie=epsilon_tie,
+                    tie_sigma=tie_sigma,
+                    ids_allocation=ids_allocation,
+                    final_policy=final_policy,
                 )
 
             # Run pulls
+            stop_reason = 'budget'
+            trial_pulls = 0
             for _ in range(n_pulls):
                 action = algo.select()
                 reward = env.pull(action)
                 algo.update(action, reward)
+                trial_pulls += 1
+
+                if hasattr(algo, 'stop_decision'):
+                    should_stop, reason, _, _ = algo.stop_decision()
+                    if should_stop:
+                        stop_reason = reason
+                        break
+
+            pulls_used.append(trial_pulls)
+            stop_reasons[stop_reason] = stop_reasons.get(stop_reason, 0) + 1
 
             # Get recommendation
             recommended = algo.recommend()
@@ -375,6 +501,8 @@ def evaluate_root_bandit(
             prob_correct=correct_count / n_trials,
             simple_regret=float(np.mean(simple_regrets)),
             pulls_to_confidence=None,
+            avg_pulls_used=float(np.mean(pulls_used)),
+            stop_reasons=stop_reasons,
         )
 
     return results
@@ -417,6 +545,18 @@ def main():
                         help='Trials per position')
     parser.add_argument('--n_positions', type=int, default=10,
                         help='Number of positions to test')
+    parser.add_argument('--confidence_threshold', type=float, default=0.99,
+                        help='TTTS prior/search consensus threshold for early stopping')
+    parser.add_argument('--epsilon_tie', type=float, default=0.02,
+                        help='TTTS epsilon-tie stopping gap (0 disables)')
+    parser.add_argument('--tie_sigma', type=float, default=1.0,
+                        help='Std multiplier for TTTS epsilon-tie stopping')
+    parser.add_argument('--ids_allocation', type=str, default='precision',
+                        choices=['precision', 'visits'],
+                        help='TTTS IDS allocation signal')
+    parser.add_argument('--final_policy', type=str, default='optimality',
+                        choices=['optimality', 'consensus'],
+                        help='TTTS recommendation policy')
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--seed', type=int, default=None)
 
@@ -454,7 +594,17 @@ def main():
         print(f"Position {i+1}/{len(positions)}...", end=" ", flush=True)
 
         for n_pulls in args.n_pulls:
-            results = evaluate_root_bandit(env, state, n_pulls, args.n_trials)
+            results = evaluate_root_bandit(
+                env,
+                state,
+                n_pulls,
+                args.n_trials,
+                confidence_threshold=args.confidence_threshold,
+                epsilon_tie=args.epsilon_tie,
+                tie_sigma=args.tie_sigma,
+                ids_allocation=args.ids_allocation,
+                final_policy=args.final_policy,
+            )
             for algo_name, result in results.items():
                 all_results[n_pulls][algo_name].append(result)
 
@@ -464,7 +614,7 @@ def main():
     print("\n" + "=" * 70)
     print("              Root-Level MCTS Bandit Summary")
     print("=" * 70)
-    print(f"\n{'Pulls':<10} {'Algorithm':<12} {'P(correct)':<15} {'Simple Regret':<15}")
+    print(f"\n{'Pulls':<10} {'Algorithm':<12} {'P(correct)':<15} {'Simple Regret':<15} {'Avg Pulls':<12} Stops")
     print("-" * 70)
 
     for n_pulls in args.n_pulls:
@@ -473,8 +623,17 @@ def main():
             avg_correct = np.mean([r.prob_correct for r in results])
             avg_regret = np.mean([r.simple_regret for r in results])
             std_regret = np.std([r.simple_regret for r in results])
+            avg_pulls = np.mean([r.avg_pulls_used for r in results])
+            stop_counts: Dict[str, int] = {}
+            for result in results:
+                for reason, count in result.stop_reasons.items():
+                    stop_counts[reason] = stop_counts.get(reason, 0) + count
+            stops = ", ".join(f"{k}:{v}" for k, v in sorted(stop_counts.items()))
 
-            print(f"{n_pulls:<10} {algo_name:<12} {avg_correct:<15.2%} {avg_regret:.4f} +/- {std_regret:.4f}")
+            print(
+                f"{n_pulls:<10} {algo_name:<12} {avg_correct:<15.2%} "
+                f"{avg_regret:.4f} +/- {std_regret:.4f} {avg_pulls:<12.1f} {stops}"
+            )
 
     print("=" * 70)
 

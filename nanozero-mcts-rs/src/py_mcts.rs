@@ -5,11 +5,11 @@
 
 use crate::bayesian_node::create_bayesian_children;
 use crate::bayesian_search::{
-    apply_bayesian_virtual_loss, bayesian_backup_with_virtual_loss_removal, get_bayesian_policy,
-    select_child_thompson_ids_with_virtual_loss, should_stop_early, BayesianSearchPath,
-    BayesianTreeArena,
+    apply_bayesian_virtual_loss, bayesian_backup_with_virtual_loss_removal,
+    get_bayesian_policy_with_mode, root_stop_decision, select_child_thompson_ids_with_virtual_loss,
+    BayesianFinalPolicy, BayesianSearchPath, BayesianTreeArena, IdsAllocation,
 };
-use crate::game::{compute_hash, Game, GameState};
+use crate::game::{Game, GameState};
 use crate::math::add_dirichlet_noise;
 use crate::search::{
     apply_virtual_loss, backup_with_virtual_loss_removal, select_child_with_virtual_loss,
@@ -354,7 +354,6 @@ impl PyBatchedMCTS {
         } else {
             num_states * 8
         };
-
         // Run simulations with virtual loss batching
         let mut sims_completed = 0u32;
         while sims_completed < num_simulations {
@@ -425,6 +424,8 @@ impl PyBatchedMCTS {
                 }
                 attempts += 1;
             }
+
+            let made_progress = !leaves_to_expand.is_empty() || !terminal_backups.is_empty();
 
             // Backup terminal leaves immediately (no NN needed)
             for (state_idx, path, value) in terminal_backups.drain(..) {
@@ -540,7 +541,7 @@ impl PyBatchedMCTS {
             }
 
             // Safety: if nothing was collected, break to avoid infinite loop
-            if leaves_to_expand.is_empty() && terminal_backups.is_empty() {
+            if !made_progress {
                 break;
             }
         }
@@ -630,6 +631,65 @@ impl PyBatchedMCTS {
 // Bayesian MCTS (TTTS) Python Bindings
 // ============================================================================
 
+#[derive(Clone, Debug)]
+struct BayesianSearchStats {
+    simulations_used: u32,
+    stop_reason: String,
+    consensus_score: f32,
+    tie_gap: f32,
+    leader_action: i32,
+    challenger_action: i32,
+    recommended_action: i32,
+}
+
+impl Default for BayesianSearchStats {
+    fn default() -> Self {
+        Self {
+            simulations_used: 0,
+            stop_reason: "none".to_string(),
+            consensus_score: 0.0,
+            tie_gap: 0.0,
+            leader_action: -1,
+            challenger_action: -1,
+            recommended_action: -1,
+        }
+    }
+}
+
+impl BayesianSearchStats {
+    fn as_tuple(&self) -> (u32, String, f32, f32, i32, i32, i32) {
+        (
+            self.simulations_used,
+            self.stop_reason.clone(),
+            self.consensus_score,
+            self.tie_gap,
+            self.leader_action,
+            self.challenger_action,
+            self.recommended_action,
+        )
+    }
+}
+
+fn optional_action_to_i32(action: Option<u16>) -> i32 {
+    action.map(|a| a as i32).unwrap_or(-1)
+}
+
+fn parse_ids_allocation(value: &str) -> IdsAllocation {
+    if value == "visits" {
+        IdsAllocation::Visits
+    } else {
+        IdsAllocation::Precision
+    }
+}
+
+fn parse_final_policy(value: &str) -> BayesianFinalPolicy {
+    if value == "consensus" {
+        BayesianFinalPolicy::Consensus
+    } else {
+        BayesianFinalPolicy::Optimality
+    }
+}
+
 /// Python wrapper for Bayesian MCTS with Thompson Sampling.
 ///
 /// Uses Gaussian beliefs instead of visit counts, and Top-Two Thompson
@@ -645,12 +705,20 @@ pub struct PyBayesianMCTS {
     obs_var: f32,
     /// IDS pseudocount
     ids_alpha: f32,
+    /// IDS allocation signal: "precision" or "visits"
+    ids_allocation: String,
+    /// Final policy exposed to Python: "optimality" or "consensus"
+    final_policy: String,
     /// Soft-prune threshold for aggregation
     prune_threshold: f32,
     /// Whether to stop early when confident
     early_stopping: bool,
-    /// P(leader is optimal) threshold for early stopping
+    /// Prior/search consensus threshold for early stopping
     confidence_threshold: f32,
+    /// Epsilon threshold for top-two indistinguishability
+    epsilon_tie: f32,
+    /// Standard-deviation multiplier for epsilon tie gap
+    tie_sigma: f32,
     /// Minimum simulations before early stopping
     min_simulations: u32,
     /// Floor for variance (numerical stability)
@@ -665,6 +733,8 @@ pub struct PyBayesianMCTS {
     transposition_table: TranspositionTable,
     /// Whether to use the transposition table
     use_transposition_table: bool,
+    /// Diagnostics from the last search batch
+    last_search_stats: Vec<BayesianSearchStats>,
 }
 
 #[pymethods]
@@ -676,9 +746,13 @@ impl PyBayesianMCTS {
     ///     sigma_0: Prior std for logit-shifted init (default 1.0)
     ///     obs_var: Observation variance (default 1.0)
     ///     ids_alpha: IDS pseudocount (default 0.0)
+    ///     ids_allocation: IDS signal, "precision" or "visits" (default "precision")
+    ///     final_policy: Returned policy, "optimality" or "consensus" (default "optimality")
     ///     prune_threshold: Soft-prune threshold (default 0.01)
     ///     early_stopping: Whether to stop early (default True)
-    ///     confidence_threshold: P(optimal) threshold for stopping (default 0.95)
+    ///     confidence_threshold: Consensus threshold for stopping (default 0.99)
+    ///     epsilon_tie: Stop when top two actions are indistinguishable (default 0.02; 0 disables)
+    ///     tie_sigma: Standard-deviation multiplier for epsilon tie gap (default 1.0)
     ///     min_simulations: Min sims before early stopping (default 10)
     ///     min_variance: Variance floor (default 1e-6)
     ///     leaves_per_batch: Leaves per NN call, 0 = auto (default 0)
@@ -691,9 +765,13 @@ impl PyBayesianMCTS {
         sigma_0=1.0,
         obs_var=1.0,
         ids_alpha=0.0,
+        ids_allocation="precision".to_string(),
+        final_policy="optimality".to_string(),
         prune_threshold=0.01,
         early_stopping=true,
-        confidence_threshold=0.95,
+        confidence_threshold=0.99,
+        epsilon_tie=0.02,
+        tie_sigma=1.0,
         min_simulations=10,
         min_variance=1e-6,
         leaves_per_batch=0,
@@ -707,9 +785,13 @@ impl PyBayesianMCTS {
         sigma_0: f32,
         obs_var: f32,
         ids_alpha: f32,
+        ids_allocation: String,
+        final_policy: String,
         prune_threshold: f32,
         early_stopping: bool,
         confidence_threshold: f32,
+        epsilon_tie: f32,
+        tie_sigma: f32,
         min_simulations: u32,
         min_variance: f32,
         leaves_per_batch: u32,
@@ -727,9 +809,13 @@ impl PyBayesianMCTS {
             sigma_0,
             obs_var,
             ids_alpha,
+            ids_allocation,
+            final_policy,
             prune_threshold,
             early_stopping,
             confidence_threshold,
+            epsilon_tie,
+            tie_sigma,
             min_simulations,
             min_variance,
             leaves_per_batch,
@@ -737,6 +823,7 @@ impl PyBayesianMCTS {
             rng,
             transposition_table: TranspositionTable::with_capacity(10000),
             use_transposition_table,
+            last_search_stats: Vec::new(),
         }
     }
 
@@ -752,6 +839,18 @@ impl PyBayesianMCTS {
     /// Returns: (hits, misses, num_entries)
     fn cache_stats(&self) -> (u64, u64, usize) {
         self.transposition_table.stats()
+    }
+
+    /// Diagnostics from the last Bayesian search batch.
+    ///
+    /// Returns tuples with:
+    /// (simulations_used, stop_reason, consensus_score, tie_gap,
+    ///  leader_action, challenger_action, recommended_action)
+    fn search_stats(&self) -> Vec<(u32, String, f32, f32, i32, i32, i32)> {
+        self.last_search_stats
+            .iter()
+            .map(BayesianSearchStats::as_tuple)
+            .collect()
     }
 
     /// Run Bayesian MCTS on a batch of TicTacToe states.
@@ -937,13 +1036,21 @@ impl PyBayesianMCTS {
         }
 
         // Track which root states are terminal
-        let root_terminal: Vec<bool> = game_states
-            .iter()
-            .map(|s| game.is_terminal(s))
-            .collect();
+        let root_terminal: Vec<bool> = game_states.iter().map(|s| game.is_terminal(s)).collect();
 
         // Track which states are still active (not stopped early)
         let mut active_mask: Vec<bool> = vec![true; num_states];
+        let mut sims_by_state: Vec<u32> = vec![0; num_states];
+        let mut stop_reasons: Vec<String> = root_terminal
+            .iter()
+            .map(|&terminal| {
+                if terminal {
+                    "terminal".to_string()
+                } else {
+                    "budget".to_string()
+                }
+            })
+            .collect();
 
         // Determine leaves per batch
         let leaves_per_batch = if self.leaves_per_batch > 0 {
@@ -951,6 +1058,8 @@ impl PyBayesianMCTS {
         } else {
             num_states * 8
         };
+        let ids_allocation = parse_ids_allocation(&self.ids_allocation);
+        let final_policy = parse_final_policy(&self.final_policy);
 
         // Run simulations
         let mut sims_completed = 0u32;
@@ -1009,6 +1118,7 @@ impl PyBayesianMCTS {
                             arena,
                             node_idx,
                             self.ids_alpha,
+                            ids_allocation,
                             self.virtual_loss_value,
                             &mut self.rng,
                         );
@@ -1022,6 +1132,8 @@ impl PyBayesianMCTS {
                 attempts += 1;
             }
 
+            let made_progress = !leaves_to_expand.is_empty() || !terminal_backups.is_empty();
+
             // Backup terminal leaves immediately (also removes virtual loss)
             for (state_idx, path, value) in terminal_backups.drain(..) {
                 bayesian_backup_with_virtual_loss_removal(
@@ -1033,6 +1145,7 @@ impl PyBayesianMCTS {
                     self.prune_threshold,
                 );
                 sims_completed += 1;
+                sims_by_state[state_idx] += 1;
             }
 
             // Expand non-terminal leaves with batched NN call
@@ -1041,7 +1154,8 @@ impl PyBayesianMCTS {
                 let mut leaf_hashes: Vec<u64> = Vec::with_capacity(leaves_to_expand.len());
                 let mut leaf_sym_indices: Vec<usize> = Vec::with_capacity(leaves_to_expand.len());
                 let mut leaves_need_nn: Vec<usize> = Vec::new();
-                let mut leaf_policies: Vec<Option<(Vec<f32>, f32)>> = vec![None; leaves_to_expand.len()];
+                let mut leaf_policies: Vec<Option<(Vec<f32>, f32)>> =
+                    vec![None; leaves_to_expand.len()];
 
                 for (leaf_idx, (_, _, leaf_state)) in leaves_to_expand.iter().enumerate() {
                     let canonical = game.canonical_state(leaf_state);
@@ -1077,7 +1191,8 @@ impl PyBayesianMCTS {
                         .map(|&i| leaves_to_expand[i].2.clone())
                         .collect();
 
-                    let (policies, values) = self.call_nn(py, &nn_callback, &states_for_nn, game)?;
+                    let (policies, values) =
+                        self.call_nn(py, &nn_callback, &states_for_nn, game)?;
 
                     for (nn_idx, &leaf_idx) in leaves_need_nn.iter().enumerate() {
                         let policy = policies[nn_idx].clone();
@@ -1149,17 +1264,25 @@ impl PyBayesianMCTS {
                         self.prune_threshold,
                     );
                     sims_completed += 1;
+                    sims_by_state[*state_idx] += 1;
                 }
             }
 
             // Early stopping check
             if self.early_stopping && sims_completed >= self.min_simulations {
                 for state_idx in 0..num_states {
-                    if active_mask[state_idx]
-                        && !root_terminal[state_idx]
-                        && should_stop_early(&arenas[state_idx], 0, self.confidence_threshold)
-                    {
-                        active_mask[state_idx] = false;
+                    if active_mask[state_idx] && !root_terminal[state_idx] {
+                        let decision = root_stop_decision(
+                            &arenas[state_idx],
+                            0,
+                            self.confidence_threshold,
+                            self.epsilon_tie,
+                            self.tie_sigma,
+                        );
+                        if decision.should_stop {
+                            active_mask[state_idx] = false;
+                            stop_reasons[state_idx] = decision.stop_reason.to_string();
+                        }
                     }
                 }
 
@@ -1170,19 +1293,47 @@ impl PyBayesianMCTS {
             }
 
             // Safety: if nothing was collected, break
-            if leaves_to_expand.is_empty() && terminal_backups.is_empty() {
+            if !made_progress {
                 break;
             }
         }
 
         // Extract policies from optimality weights
         let mut result = vec![0.0f32; num_states * action_size];
+        let mut last_search_stats: Vec<BayesianSearchStats> = Vec::with_capacity(num_states);
         for (state_idx, arena) in arenas.iter().enumerate() {
-            let policy = get_bayesian_policy(arena, 0, action_size);
+            if root_terminal[state_idx] {
+                last_search_stats.push(BayesianSearchStats {
+                    simulations_used: sims_by_state[state_idx],
+                    stop_reason: stop_reasons[state_idx].clone(),
+                    ..BayesianSearchStats::default()
+                });
+                continue;
+            }
+
+            let policy = get_bayesian_policy_with_mode(arena, 0, action_size, final_policy);
             for (a, &p) in policy.iter().enumerate() {
                 result[state_idx * action_size + a] = p;
             }
+
+            let decision = root_stop_decision(
+                arena,
+                0,
+                self.confidence_threshold,
+                self.epsilon_tie,
+                self.tie_sigma,
+            );
+            last_search_stats.push(BayesianSearchStats {
+                simulations_used: sims_by_state[state_idx],
+                stop_reason: stop_reasons[state_idx].clone(),
+                consensus_score: decision.consensus_score,
+                tie_gap: decision.tie_gap,
+                leader_action: optional_action_to_i32(decision.leader_action),
+                challenger_action: optional_action_to_i32(decision.challenger_action),
+                recommended_action: optional_action_to_i32(decision.recommended_action),
+            });
         }
+        self.last_search_stats = last_search_stats;
 
         Ok(PyArray1::from_vec_bound(py, result)
             .reshape([num_states, action_size])
@@ -1280,19 +1431,23 @@ mod tests {
     #[test]
     fn test_py_bayesian_mcts_creation() {
         let mcts = PyBayesianMCTS::new(
-            1000,  // num_simulations
-            1.0,   // sigma_0
-            1.0,   // obs_var
-            0.0,   // ids_alpha
-            0.01,  // prune_threshold
-            true,  // early_stopping
-            0.95,  // confidence_threshold
-            10,    // min_simulations
-            1e-6,  // min_variance
-            0,     // leaves_per_batch
-            1.0,   // virtual_loss_value
+            1000, // num_simulations
+            1.0,  // sigma_0
+            1.0,  // obs_var
+            0.0,  // ids_alpha
+            "precision".to_string(),
+            "optimality".to_string(),
+            0.01, // prune_threshold
+            true, // early_stopping
+            0.99, // confidence_threshold
+            0.02, // epsilon_tie
+            1.0,  // tie_sigma
+            10,   // min_simulations
+            1e-6, // min_variance
+            0,    // leaves_per_batch
+            1.0,  // virtual_loss_value
             Some(42),
-            true,  // use_transposition_table
+            true, // use_transposition_table
         );
         assert_eq!(mcts.num_simulations, 1000);
         assert_eq!(mcts.sigma_0, 1.0);

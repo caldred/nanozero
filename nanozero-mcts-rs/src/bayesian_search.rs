@@ -3,7 +3,7 @@
 //! Implements Top-Two Thompson Sampling with IDS allocation and
 //! variance-propagating backup.
 
-use crate::bayesian_node::{aggregate_children, BayesianNode};
+use crate::bayesian_node::{aggregate_children, pairwise_optimality_weights, BayesianNode};
 use crate::tree::ChildEntry;
 use smallvec::SmallVec;
 
@@ -96,12 +96,7 @@ impl BayesianTreeArena {
     ///
     /// If `visited_only` is true, only children with visits > 0
     /// are included in the aggregation.
-    pub fn update_aggregated(
-        &mut self,
-        node_idx: u32,
-        prune_threshold: f32,
-        visited_only: bool,
-    ) {
+    pub fn update_aggregated(&mut self, node_idx: u32, prune_threshold: f32, visited_only: bool) {
         let children = self.get_children(node_idx);
         if children.is_empty() {
             return;
@@ -179,6 +174,229 @@ impl Default for BayesianSearchPath {
     }
 }
 
+/// Root child belief from the parent's perspective.
+#[derive(Clone, Debug)]
+pub struct RootChildBelief {
+    pub action: u16,
+    pub prior: f32,
+    pub mu: f32,
+    pub sigma_sq: f32,
+    pub weight: f32,
+}
+
+/// Root-level stopping decision and diagnostics.
+#[derive(Clone, Debug)]
+pub struct BayesianRootDecision {
+    pub should_stop: bool,
+    pub stop_reason: &'static str,
+    pub consensus_score: f32,
+    pub tie_gap: f32,
+    pub leader_action: Option<u16>,
+    pub challenger_action: Option<u16>,
+    pub recommended_action: Option<u16>,
+}
+
+/// IDS allocation signal for top-two sampling.
+#[derive(Clone, Copy, Debug)]
+pub enum IdsAllocation {
+    Precision,
+    Visits,
+}
+
+/// Final root policy exposed to training/self-play.
+#[derive(Clone, Copy, Debug)]
+pub enum BayesianFinalPolicy {
+    Optimality,
+    Consensus,
+}
+
+/// Compute root optimality weights from child Gaussian beliefs.
+///
+/// This is the single source of truth for the Bayesian root policy and
+/// root-level stopping diagnostics. Child values are converted to the
+/// parent's perspective by negating the stored child belief mean.
+pub fn root_optimality_weights(arena: &BayesianTreeArena, root_idx: u32) -> Vec<RootChildBelief> {
+    let children = arena.get_children(root_idx);
+    let n = children.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut beliefs: Vec<RootChildBelief> = children
+        .iter()
+        .map(|c| {
+            let child = arena.get(c.node_idx);
+            RootChildBelief {
+                action: c.action,
+                prior: child.prior,
+                mu: -child.mu,
+                sigma_sq: child.sigma_sq,
+                weight: 0.0,
+            }
+        })
+        .collect();
+
+    let child_beliefs: Vec<(f32, f32)> = beliefs
+        .iter()
+        .map(|belief| (belief.mu, belief.sigma_sq))
+        .collect();
+    let weights = pairwise_optimality_weights(&child_beliefs, 0.0);
+    for (belief, weight) in beliefs.iter_mut().zip(weights.iter()) {
+        belief.weight = *weight;
+    }
+
+    beliefs
+}
+
+/// Root policy derived from Bayesian optimality weights and optional prior pooling.
+pub fn get_bayesian_policy_with_mode(
+    arena: &BayesianTreeArena,
+    root_idx: u32,
+    action_size: usize,
+    final_policy: BayesianFinalPolicy,
+) -> Vec<f32> {
+    let mut policy = vec![0.0f32; action_size];
+    let beliefs = root_optimality_weights(arena, root_idx);
+    if beliefs.is_empty() {
+        return policy;
+    }
+
+    match final_policy {
+        BayesianFinalPolicy::Optimality => {
+            for belief in beliefs {
+                policy[belief.action as usize] = belief.weight;
+            }
+        }
+        BayesianFinalPolicy::Consensus => {
+            let mut total = 0.0f32;
+            for belief in &beliefs {
+                let pooled = (belief.prior.max(0.0) * belief.weight.max(0.0)).sqrt();
+                policy[belief.action as usize] = pooled;
+                total += pooled;
+            }
+            if total > 1e-10 {
+                for p in policy.iter_mut() {
+                    *p /= total;
+                }
+            } else {
+                for belief in beliefs {
+                    policy[belief.action as usize] = belief.weight;
+                }
+            }
+        }
+    }
+
+    policy
+}
+
+/// Analyze whether root search can stop early.
+pub fn root_stop_decision(
+    arena: &BayesianTreeArena,
+    root_idx: u32,
+    confidence_threshold: f32,
+    epsilon_tie: f32,
+    tie_sigma: f32,
+) -> BayesianRootDecision {
+    let beliefs = root_optimality_weights(arena, root_idx);
+
+    if beliefs.is_empty() {
+        return BayesianRootDecision {
+            should_stop: true,
+            stop_reason: "terminal",
+            consensus_score: 0.0,
+            tie_gap: 0.0,
+            leader_action: None,
+            challenger_action: None,
+            recommended_action: None,
+        };
+    }
+
+    let recommended_action = beliefs
+        .iter()
+        .max_by(|a, b| {
+            a.weight
+                .partial_cmp(&b.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|b| b.action);
+
+    if beliefs.len() == 1 {
+        return BayesianRootDecision {
+            should_stop: true,
+            stop_reason: "forced",
+            consensus_score: 1.0,
+            tie_gap: 0.0,
+            leader_action: Some(beliefs[0].action),
+            challenger_action: None,
+            recommended_action,
+        };
+    }
+
+    let mut sorted_indices: Vec<usize> = (0..beliefs.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        beliefs[b]
+            .mu
+            .partial_cmp(&beliefs[a].mu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let leader = &beliefs[sorted_indices[0]];
+    let challenger = &beliefs[sorted_indices[1]];
+    let tie_gap = (leader.mu - challenger.mu).abs()
+        + tie_sigma.max(0.0) * (leader.sigma_sq + challenger.sigma_sq).sqrt();
+
+    let mut pooled_total = 0.0f32;
+    let mut pooled_max = 0.0f32;
+    for belief in &beliefs {
+        let pooled = (belief.prior.max(0.0) * belief.weight.max(0.0)).sqrt();
+        pooled_total += pooled;
+        pooled_max = pooled_max.max(pooled);
+    }
+
+    let normalized_consensus = if pooled_total > 1e-10 {
+        pooled_max / pooled_total
+    } else {
+        0.0
+    };
+    // The normalized geometric score alone can be spuriously high when the
+    // prior/search overlap is tiny, so gate it by the Hellinger affinity.
+    let consensus_score = normalized_consensus.min(pooled_total);
+
+    let (should_stop, stop_reason) = if consensus_score >= confidence_threshold {
+        (true, "consensus")
+    } else if epsilon_tie > 0.0 && tie_gap <= epsilon_tie {
+        (true, "epsilon_tie")
+    } else {
+        (false, "none")
+    };
+
+    BayesianRootDecision {
+        should_stop,
+        stop_reason,
+        consensus_score,
+        tie_gap,
+        leader_action: Some(leader.action),
+        challenger_action: Some(challenger.action),
+        recommended_action,
+    }
+}
+
+fn ids_allocation_signal(node: &BayesianNode, allocation: IdsAllocation) -> f32 {
+    match allocation {
+        IdsAllocation::Precision => node.precision(),
+        IdsAllocation::Visits => node.visits as f32,
+    }
+}
+
+fn challenger_probability(leader_signal: f32, challenger_signal: f32, ids_alpha: f32) -> f32 {
+    let denom = leader_signal + challenger_signal + 2.0 * ids_alpha;
+    if denom > 1e-10 {
+        (leader_signal + ids_alpha) / denom
+    } else {
+        0.5
+    }
+}
+
 /// Top-Two Thompson Sampling with IDS allocation.
 ///
 /// 1. Draw Thompson sample from each child's posterior
@@ -190,6 +408,7 @@ pub fn select_child_thompson_ids<R: rand::Rng>(
     arena: &BayesianTreeArena,
     node_idx: u32,
     ids_alpha: f32,
+    ids_allocation: IdsAllocation,
     rng: &mut R,
 ) -> (u16, u32) {
     let children = arena.get_children(node_idx);
@@ -216,13 +435,12 @@ pub fn select_child_thompson_ids<R: rand::Rng>(
     let (challenger_action, challenger_idx, _) = samples[1];
 
     // IDS allocation probability
-    let leader_precision = arena.get(leader_idx).precision();
-    let challenger_precision = arena.get(challenger_idx).precision();
+    let leader_signal = ids_allocation_signal(arena.get(leader_idx), ids_allocation);
+    let challenger_signal = ids_allocation_signal(arena.get(challenger_idx), ids_allocation);
 
     // beta = probability of selecting challenger
     // High leader precision → explore challenger more
-    let beta = (leader_precision + ids_alpha)
-        / (leader_precision + challenger_precision + 2.0 * ids_alpha);
+    let beta = challenger_probability(leader_signal, challenger_signal, ids_alpha);
 
     // Select challenger with probability beta
     if rng.gen::<f32>() < beta {
@@ -240,6 +458,7 @@ pub fn select_child_thompson_ids_with_virtual_loss<R: rand::Rng>(
     arena: &BayesianTreeArena,
     node_idx: u32,
     ids_alpha: f32,
+    ids_allocation: IdsAllocation,
     virtual_loss_value: f32,
     rng: &mut R,
 ) -> (u16, u32) {
@@ -269,12 +488,11 @@ pub fn select_child_thompson_ids_with_virtual_loss<R: rand::Rng>(
     let (challenger_action, challenger_idx, _) = samples[1];
 
     // IDS allocation probability
-    let leader_precision = arena.get(leader_idx).precision();
-    let challenger_precision = arena.get(challenger_idx).precision();
+    let leader_signal = ids_allocation_signal(arena.get(leader_idx), ids_allocation);
+    let challenger_signal = ids_allocation_signal(arena.get(challenger_idx), ids_allocation);
 
     // beta = probability of selecting challenger
-    let beta = (leader_precision + ids_alpha)
-        / (leader_precision + challenger_precision + 2.0 * ids_alpha);
+    let beta = challenger_probability(leader_signal, challenger_signal, ids_alpha);
 
     // Select challenger with probability beta
     if rng.gen::<f32>() < beta {
@@ -335,7 +553,9 @@ pub fn bayesian_backup(
             let child = arena.get(child_idx);
             if !child.expanded() {
                 // Terminal or unexpanded: do Bayesian update with observation
-                arena.get_mut(child_idx).update(leaf_value, obs_var, min_variance);
+                arena
+                    .get_mut(child_idx)
+                    .update(leaf_value, obs_var, min_variance);
             } else {
                 // Just expanded: its agg_mu/agg_sigma_sq were set during expansion
                 // Copy aggregated belief to own belief
@@ -350,11 +570,7 @@ pub fn bayesian_backup(
         // else: child's mu/sigma_sq were updated in previous iteration
 
         // Aggregate parent's children (visited only)
-        arena.update_aggregated(
-            parent_idx,
-            prune_threshold,
-            true,
-        );
+        arena.update_aggregated(parent_idx, prune_threshold, true);
 
         // Copy aggregated belief to own belief (no Bayesian update!)
         // This is what the grandparent will see when it aggregates
@@ -395,7 +611,9 @@ pub fn bayesian_backup_with_virtual_loss_removal(
         if iteration == 0 {
             let child = arena.get(child_idx);
             if !child.expanded() {
-                arena.get_mut(child_idx).update(leaf_value, obs_var, min_variance);
+                arena
+                    .get_mut(child_idx)
+                    .update(leaf_value, obs_var, min_variance);
             } else {
                 let child = arena.get(child_idx);
                 if let (Some(agg_mu), Some(agg_sigma_sq)) = (child.agg_mu, child.agg_sigma_sq) {
@@ -422,6 +640,7 @@ pub fn bayesian_select_to_leaf<R: rand::Rng, F>(
     arena: &BayesianTreeArena,
     root_idx: u32,
     ids_alpha: f32,
+    ids_allocation: IdsAllocation,
     rng: &mut R,
     mut is_terminal_fn: F,
 ) -> (BayesianSearchPath, bool)
@@ -445,7 +664,8 @@ where
         }
 
         // Select using Thompson sampling with IDS
-        let (action, child_idx) = select_child_thompson_ids(arena, node_idx, ids_alpha, rng);
+        let (action, child_idx) =
+            select_child_thompson_ids(arena, node_idx, ids_alpha, ids_allocation, rng);
         path.push(action, child_idx);
         node_idx = child_idx;
     }
@@ -454,117 +674,30 @@ where
 /// Get policy from optimality weights.
 ///
 /// Computes P(each child is optimal) using pairwise Gaussian CDF comparisons.
-pub fn get_bayesian_policy(arena: &BayesianTreeArena, root_idx: u32, action_size: usize) -> Vec<f32> {
-    use crate::math::normal_cdf;
-
-    let mut policy = vec![0.0f32; action_size];
-    let children = arena.get_children(root_idx);
-
-    if children.is_empty() {
-        return policy;
-    }
-
-    if children.len() == 1 {
-        policy[children[0].action as usize] = 1.0;
-        return policy;
-    }
-
-    // Get beliefs from parent's perspective
-    let beliefs: Vec<(f32, f32)> = children
-        .iter()
-        .map(|c| {
-            let child = arena.get(c.node_idx);
-            (-child.mu, child.sigma_sq) // Negate for parent's perspective
-        })
-        .collect();
-
-    // Find leader and challenger
-    let mut sorted_indices: Vec<usize> = (0..beliefs.len()).collect();
-    sorted_indices.sort_by(|&a, &b| {
-        beliefs[b]
-            .0
-            .partial_cmp(&beliefs[a].0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let leader_idx = sorted_indices[0];
-    let challenger_idx = sorted_indices[1];
-
-    let (mu_l, sigma_sq_l) = beliefs[leader_idx];
-    let (mu_c, sigma_sq_c) = beliefs[challenger_idx];
-
-    // Compute scores
-    let mut scores = vec![0.0f32; beliefs.len()];
-    for i in 0..beliefs.len() {
-        let (mu_i, sigma_sq_i) = beliefs[i];
-
-        let (diff, combined_var) = if i == leader_idx {
-            (mu_l - mu_c, sigma_sq_l + sigma_sq_c)
-        } else {
-            (mu_i - mu_l, sigma_sq_i + sigma_sq_l)
-        };
-
-        let std = combined_var.sqrt();
-        scores[i] = if std > 1e-10 {
-            normal_cdf(diff / std)
-        } else if diff > 0.0 {
-            1.0
-        } else {
-            0.0
-        };
-    }
-
-    // Normalize
-    let total: f32 = scores.iter().sum();
-    if total < 1e-10 {
-        // Uniform fallback
-        for child in children {
-            policy[child.action as usize] = 1.0 / children.len() as f32;
-        }
-    } else {
-        for (i, child) in children.iter().enumerate() {
-            policy[child.action as usize] = scores[i] / total;
-        }
-    }
-
-    policy
+pub fn get_bayesian_policy(
+    arena: &BayesianTreeArena,
+    root_idx: u32,
+    action_size: usize,
+) -> Vec<f32> {
+    get_bayesian_policy_with_mode(
+        arena,
+        root_idx,
+        action_size,
+        BayesianFinalPolicy::Optimality,
+    )
 }
 
 /// Check if early stopping condition is met.
 ///
-/// Uses P(leader > challenger) as lower bound on P(leader is optimal).
+/// Uses geometric consensus between the policy prior and Bayesian root
+/// optimality weights. Kept as a small compatibility wrapper for tests and
+/// callers that only need a boolean decision.
 pub fn should_stop_early(
     arena: &BayesianTreeArena,
     root_idx: u32,
     confidence_threshold: f32,
 ) -> bool {
-    use crate::math::normal_cdf;
-
-    let children = arena.get_children(root_idx);
-    if children.len() <= 1 {
-        return true;
-    }
-
-    // Find leader and challenger by mean value
-    let mut beliefs: Vec<(u32, f32, f32)> = children
-        .iter()
-        .map(|c| {
-            let child = arena.get(c.node_idx);
-            (c.node_idx, -child.mu, child.sigma_sq) // Negate for parent's perspective
-        })
-        .collect();
-
-    beliefs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let (_, mu_leader, sigma_sq_leader) = beliefs[0];
-    let (_, mu_challenger, sigma_sq_challenger) = beliefs[1];
-
-    let std_diff = (sigma_sq_leader + sigma_sq_challenger).sqrt();
-    if std_diff < 1e-10 {
-        return mu_leader > mu_challenger;
-    }
-
-    let prob_leader_better = normal_cdf((mu_leader - mu_challenger) / std_diff);
-    prob_leader_better >= confidence_threshold
+    root_stop_decision(arena, root_idx, confidence_threshold, 0.0, 1.0).should_stop
 }
 
 #[cfg(test)]
@@ -599,7 +732,8 @@ mod tests {
 
         // Run many selections
         for _ in 0..1000 {
-            let (action, _) = select_child_thompson_ids(&arena, root, 1.0, &mut rng);
+            let (action, _) =
+                select_child_thompson_ids(&arena, root, 1.0, IdsAllocation::Precision, &mut rng);
             action_counts[action as usize] += 1;
         }
 
@@ -659,6 +793,23 @@ mod tests {
     }
 
     #[test]
+    fn test_root_optimality_weights_are_normalized() {
+        let mut arena = BayesianTreeArena::new(100);
+        let root = arena.new_root();
+
+        let actions = vec![1, 3, 4];
+        let params = vec![(0.3, -0.4, 0.2), (0.4, 0.0, 0.2), (0.3, 0.2, 0.2)];
+        arena.add_children(root, &actions, &params);
+
+        let weights = root_optimality_weights(&arena, root);
+        let sum: f32 = weights.iter().map(|w| w.weight).sum();
+
+        assert_eq!(weights.len(), 3);
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(weights.iter().all(|w| actions.contains(&w.action)));
+    }
+
+    #[test]
     fn test_early_stopping() {
         let mut arena = BayesianTreeArena::new(100);
         let root = arena.new_root();
@@ -666,8 +817,8 @@ mod tests {
         // Clear winner
         let actions = vec![0, 1];
         let params = vec![
-            (0.5, -1.0, 0.01), // Very confident good
-            (0.5, 1.0, 0.01),  // Very confident bad
+            (0.99, -1.0, 0.01), // Prior and search agree on a clear winner
+            (0.01, 1.0, 0.01),
         ];
         arena.add_children(root, &actions, &params);
 
@@ -683,5 +834,65 @@ mod tests {
         arena.add_children(root, &actions, &params);
 
         assert!(!should_stop_early(&arena, root, 0.95));
+    }
+
+    #[test]
+    fn test_consensus_stop_requires_prior_search_agreement() {
+        let actions = vec![0, 1];
+
+        let mut arena = BayesianTreeArena::new(100);
+        let root = arena.new_root();
+        let agreeing_params = vec![
+            (0.99, -1.0, 0.01), // Prior and search both favor action 0
+            (0.01, 1.0, 0.01),
+        ];
+        arena.add_children(root, &actions, &agreeing_params);
+
+        let decision = root_stop_decision(&arena, root, 0.95, 0.0, 1.0);
+        assert!(decision.should_stop);
+        assert_eq!(decision.stop_reason, "consensus");
+        assert!(decision.consensus_score > 0.95);
+
+        arena.clear();
+        let root = arena.new_root();
+        let disagreeing_params = vec![
+            (0.01, -1.0, 0.01), // Search favors action 0, prior favors action 1
+            (0.99, 1.0, 0.01),
+        ];
+        arena.add_children(root, &actions, &disagreeing_params);
+
+        let decision = root_stop_decision(&arena, root, 0.95, 0.0, 1.0);
+        assert!(!decision.should_stop);
+        assert!(decision.consensus_score < 0.95);
+    }
+
+    #[test]
+    fn test_epsilon_tie_stop() {
+        let actions = vec![0, 1];
+
+        let mut arena = BayesianTreeArena::new(100);
+        let root = arena.new_root();
+        let close_low_variance = vec![(0.5, -0.01, 0.0001), (0.5, 0.01, 0.0001)];
+        arena.add_children(root, &actions, &close_low_variance);
+
+        let decision = root_stop_decision(&arena, root, 0.99, 0.05, 1.0);
+        assert!(decision.should_stop);
+        assert_eq!(decision.stop_reason, "epsilon_tie");
+
+        arena.clear();
+        let root = arena.new_root();
+        let close_high_variance = vec![(0.5, -0.01, 1.0), (0.5, 0.01, 1.0)];
+        arena.add_children(root, &actions, &close_high_variance);
+
+        let decision = root_stop_decision(&arena, root, 0.99, 0.05, 1.0);
+        assert!(!decision.should_stop);
+
+        arena.clear();
+        let root = arena.new_root();
+        let clear_gap = vec![(0.5, -0.5, 0.0001), (0.5, 0.5, 0.0001)];
+        arena.add_children(root, &actions, &clear_gap);
+
+        let decision = root_stop_decision(&arena, root, 0.99, 0.05, 1.0);
+        assert!(!decision.should_stop);
     }
 }

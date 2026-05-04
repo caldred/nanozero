@@ -204,9 +204,13 @@ class BayesianMCTS:
             sigma_0=config.sigma_0,
             obs_var=config.obs_var,
             ids_alpha=config.ids_alpha,
+            ids_allocation=config.ids_allocation,
+            final_policy=config.final_policy,
             prune_threshold=config.prune_threshold,
             early_stopping=config.early_stopping,
             confidence_threshold=config.confidence_threshold,
+            epsilon_tie=config.epsilon_tie,
+            tie_sigma=config.tie_sigma,
             min_simulations=config.min_simulations,
             min_variance=config.min_variance,
             leaves_per_batch=leaves_per_batch,
@@ -252,6 +256,23 @@ class BayesianMCTS:
             Tuple of (hits, misses, num_entries)
         """
         return self._rust_mcts.cache_stats()
+
+    def search_stats(self) -> list[dict]:
+        """Get diagnostics from the most recent search batch.
+
+        Returns:
+            List of dictionaries, one per searched root state.
+        """
+        keys = (
+            "simulations_used",
+            "stop_reason",
+            "consensus_score",
+            "tie_gap",
+            "leader_action",
+            "challenger_action",
+            "recommended_action",
+        )
+        return [dict(zip(keys, row)) for row in self._rust_mcts.search_stats()]
 
     def search(
         self,

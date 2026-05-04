@@ -295,6 +295,18 @@ def main():
                         help='Observation variance for NN value updates')
     parser.add_argument('--ids_alpha', type=float, default=0.5,
                         help='IDS pseudocount for exploration')
+    parser.add_argument('--ids_allocation', type=str, default='precision',
+                        choices=['precision', 'visits'],
+                        help='IDS allocation signal')
+    parser.add_argument('--final_policy', type=str, default='optimality',
+                        choices=['optimality', 'consensus'],
+                        help='Policy returned by Bayesian search')
+    parser.add_argument('--confidence_threshold', type=float, default=0.99,
+                        help='Geometric prior/search consensus threshold for Bayesian early stopping')
+    parser.add_argument('--epsilon_tie', type=float, default=0.02,
+                        help='Bayesian epsilon-tie root stopping gap (0 disables)')
+    parser.add_argument('--tie_sigma', type=float, default=1.0,
+                        help='Std multiplier for Bayesian epsilon-tie root stopping')
 
     # Device
     parser.add_argument('--device', type=str, default='auto',
@@ -333,6 +345,11 @@ def main():
             sigma_0=args.sigma_0,
             obs_var=args.obs_var,
             ids_alpha=args.ids_alpha,
+            ids_allocation=args.ids_allocation,
+            final_policy=args.final_policy,
+            confidence_threshold=args.confidence_threshold,
+            epsilon_tie=args.epsilon_tie,
+            tie_sigma=args.tie_sigma,
         )
         mcts = BayesianMCTS(game, mcts_config, leaves_per_batch=args.leaves_per_batch)
         mcts_type = "BayesianMCTS (TTTS-IDS)"

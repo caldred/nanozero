@@ -76,6 +76,47 @@ class TestBayesianMCTS:
         for i in range(4):
             assert abs(policies[i].sum() - 1.0) < 1e-6
 
+    def test_search_stats_returns_diagnostics(self, game, model):
+        """Search exposes Bayesian root stopping diagnostics."""
+        mcts = BayesianMCTS(
+            game,
+            BayesianMCTSConfig(num_simulations=5, early_stopping=False),
+            leaves_per_batch=1,
+            use_transposition_table=False,
+        )
+
+        mcts.search(game.initial_state()[np.newaxis, ...], model)
+        stats = mcts.search_stats()
+
+        assert len(stats) == 1
+        assert stats[0]["stop_reason"] == "budget"
+        assert stats[0]["simulations_used"] == 5
+        assert 0.0 <= stats[0]["consensus_score"] <= 1.0
+        assert stats[0]["leader_action"] >= 0
+        assert stats[0]["recommended_action"] >= 0
+
+    def test_search_with_visit_ids_and_consensus_policy(self, game, model):
+        """Ablation knobs are accepted and still return a legal policy."""
+        mcts = BayesianMCTS(
+            game,
+            BayesianMCTSConfig(
+                num_simulations=10,
+                ids_allocation="visits",
+                final_policy="consensus",
+                early_stopping=False,
+            ),
+            leaves_per_batch=1,
+            use_transposition_table=False,
+        )
+
+        policy = mcts.search(game.initial_state()[np.newaxis, ...], model)[0]
+
+        assert abs(policy.sum() - 1.0) < 1e-6
+        legal_actions = game.legal_actions(game.initial_state())
+        for action, prob in enumerate(policy):
+            if action not in legal_actions:
+                assert prob == 0.0
+
     def test_clear_cache(self, game, config):
         """Clearing cache works (no-op for Rust)."""
         mcts = BayesianMCTS(game, config)
@@ -140,7 +181,7 @@ class TestTerminalStates:
     """Tests for terminal state handling."""
 
     def test_search_on_terminal_state(self):
-        """Search on terminal state returns valid policy (not all zeros)."""
+        """Search on terminal state returns a zero policy."""
         game = get_game('tictactoe')
         model_config = get_model_config(game.config, n_layer=2)
         model = AlphaZeroTransformer(model_config)
@@ -163,9 +204,7 @@ class TestTerminalStates:
         states = state[np.newaxis, ...]
         policy = mcts.search(states, model)[0]
 
-        # Policy should be valid (sum to 1 or be all zeros for terminal with no legal moves)
-        # For a terminal TicTacToe state, there are no legal moves
-        assert policy.sum() == 0.0 or abs(policy.sum() - 1.0) < 1e-6
+        assert policy.sum() == 0.0
 
     def test_mixed_terminal_and_non_terminal(self):
         """Batch with mix of terminal and non-terminal states."""
@@ -194,8 +233,8 @@ class TestTerminalStates:
         # First policy should be valid (non-terminal)
         assert abs(policies[0].sum() - 1.0) < 1e-6
 
-        # Second policy can be zeros (terminal, no legal moves)
-        assert policies[1].sum() == 0.0 or abs(policies[1].sum() - 1.0) < 1e-6
+        # Terminal roots should not return a playable search policy.
+        assert policies[1].sum() == 0.0
 
 
 class TestIntegration:
@@ -265,6 +304,54 @@ class TestPUCTVsBayesianComparison:
 
         # Both should have same legal actions
         assert np.count_nonzero(policy_puct) == np.count_nonzero(policy_bayes)
+
+    def test_puct_continues_after_terminal_only_batches(self):
+        """PUCT keeps simulating after selecting only terminal leaves."""
+        game = get_game('tictactoe')
+        model = self.DummyUniformModel(game.config.action_size)
+
+        # X to move must block action 5, or O wins immediately on the next move.
+        state = game.initial_state()
+        for action in [0, 3, 6, 4]:
+            state = game.next_state(state, action)
+
+        mcts = BatchedMCTS(
+            game,
+            MCTSConfig(num_simulations=200, c_puct=1.0),
+            leaves_per_batch=1,
+            use_transposition_table=False,
+        )
+        policy = mcts.search(state[np.newaxis, ...], model, add_noise=False)[0]
+
+        assert int(np.argmax(policy)) == 5
+        assert policy[5] > 0.8
+
+    def test_bayesian_ttts_continues_after_terminal_only_batches(self):
+        """TTTS keeps simulating after selecting only terminal leaves."""
+        game = get_game('tictactoe')
+        model = self.DummyUniformModel(game.config.action_size)
+
+        # X to move must block action 5, or O wins immediately on the next move.
+        state = game.initial_state()
+        for action in [0, 3, 6, 4]:
+            state = game.next_state(state, action)
+
+        mcts = BayesianMCTS(
+            game,
+            BayesianMCTSConfig(
+                num_simulations=200,
+                obs_var=0.5,
+                ids_alpha=0.5,
+                early_stopping=False,
+            ),
+            leaves_per_batch=1,
+            seed=42,
+            use_transposition_table=False,
+        )
+        policy = mcts.search(state[np.newaxis, ...], model)[0]
+
+        assert int(np.argmax(policy)) == 5
+        assert policy[5] > 0.95
 
 
 class TestBayesianMCTSGo:
