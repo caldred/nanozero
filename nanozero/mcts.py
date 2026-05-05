@@ -267,6 +267,7 @@ class BayesianMCTS:
             "simulations_used",
             "stop_reason",
             "consensus_score",
+            "search_confidence",
             "tie_gap",
             "leader_action",
             "challenger_action",

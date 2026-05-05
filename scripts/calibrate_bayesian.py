@@ -69,6 +69,32 @@ def bucket_index(confidence: float, n_buckets: int) -> int:
     return min(n_buckets - 1, max(0, int(confidence * n_buckets)))
 
 
+def new_buckets(n_buckets: int):
+    return [{"n": 0, "correct": 0, "conf": 0.0} for _ in range(n_buckets)]
+
+
+def add_bucket_sample(buckets, confidence: float, correct: bool):
+    b = buckets[bucket_index(confidence, len(buckets))]
+    b["n"] += 1
+    b["correct"] += int(correct)
+    b["conf"] += confidence
+
+
+def print_calibration_table(name: str, buckets):
+    ece = 0.0
+    total = sum(b["n"] for b in buckets)
+    print(f"{name}_bucket,count,avg_conf,accuracy")
+    for i, b in enumerate(buckets):
+        if b["n"] == 0:
+            print(f"{i},0,na,na")
+            continue
+        avg_conf = b["conf"] / b["n"]
+        acc = b["correct"] / b["n"]
+        ece += (b["n"] / total) * abs(avg_conf - acc)
+        print(f"{i},{b['n']},{avg_conf:.4f},{acc:.4f}")
+    print(f"{name}_ece,{ece:.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Calibrate Bayesian MCTS on solved TicTacToe")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -123,7 +149,8 @@ def main():
     )
 
     exact_value = minimax_values(game)
-    buckets = [{"n": 0, "correct": 0, "conf": 0.0} for _ in range(args.buckets)]
+    consensus_buckets = new_buckets(args.buckets)
+    search_buckets = new_buckets(args.buckets)
     stop_reasons = {}
     sims_used = []
 
@@ -138,28 +165,13 @@ def main():
         }
         best_value = max(action_values.values())
         correct = action_values[action] == best_value
-        confidence = float(stats["consensus_score"])
-
-        b = buckets[bucket_index(confidence, args.buckets)]
-        b["n"] += 1
-        b["correct"] += int(correct)
-        b["conf"] += confidence
+        add_bucket_sample(consensus_buckets, float(stats["consensus_score"]), correct)
+        add_bucket_sample(search_buckets, float(stats["search_confidence"]), correct)
         stop_reasons[stats["stop_reason"]] = stop_reasons.get(stats["stop_reason"], 0) + 1
         sims_used.append(stats["simulations_used"])
 
-    ece = 0.0
-    total = sum(b["n"] for b in buckets)
-    print("bucket,count,avg_conf,accuracy")
-    for i, b in enumerate(buckets):
-        if b["n"] == 0:
-            print(f"{i},0,na,na")
-            continue
-        avg_conf = b["conf"] / b["n"]
-        acc = b["correct"] / b["n"]
-        ece += (b["n"] / total) * abs(avg_conf - acc)
-        print(f"{i},{b['n']},{avg_conf:.4f},{acc:.4f}")
-
-    print(f"ece,{ece:.4f}")
+    print_calibration_table("consensus", consensus_buckets)
+    print_calibration_table("search", search_buckets)
     print(f"avg_sims,{np.mean(sims_used):.2f}")
     print("stops," + ",".join(f"{k}:{v}" for k, v in sorted(stop_reasons.items())))
 

@@ -636,6 +636,7 @@ struct BayesianSearchStats {
     simulations_used: u32,
     stop_reason: String,
     consensus_score: f32,
+    search_confidence: f32,
     tie_gap: f32,
     leader_action: i32,
     challenger_action: i32,
@@ -648,6 +649,7 @@ impl Default for BayesianSearchStats {
             simulations_used: 0,
             stop_reason: "none".to_string(),
             consensus_score: 0.0,
+            search_confidence: 0.0,
             tie_gap: 0.0,
             leader_action: -1,
             challenger_action: -1,
@@ -657,11 +659,12 @@ impl Default for BayesianSearchStats {
 }
 
 impl BayesianSearchStats {
-    fn as_tuple(&self) -> (u32, String, f32, f32, i32, i32, i32) {
+    fn as_tuple(&self) -> (u32, String, f32, f32, f32, i32, i32, i32) {
         (
             self.simulations_used,
             self.stop_reason.clone(),
             self.consensus_score,
+            self.search_confidence,
             self.tie_gap,
             self.leader_action,
             self.challenger_action,
@@ -844,9 +847,9 @@ impl PyBayesianMCTS {
     /// Diagnostics from the last Bayesian search batch.
     ///
     /// Returns tuples with:
-    /// (simulations_used, stop_reason, consensus_score, tie_gap,
+    /// (simulations_used, stop_reason, consensus_score, search_confidence, tie_gap,
     ///  leader_action, challenger_action, recommended_action)
-    fn search_stats(&self) -> Vec<(u32, String, f32, f32, i32, i32, i32)> {
+    fn search_stats(&self) -> Vec<(u32, String, f32, f32, f32, i32, i32, i32)> {
         self.last_search_stats
             .iter()
             .map(BayesianSearchStats::as_tuple)
@@ -1327,6 +1330,7 @@ impl PyBayesianMCTS {
                 simulations_used: sims_by_state[state_idx],
                 stop_reason: stop_reasons[state_idx].clone(),
                 consensus_score: decision.consensus_score,
+                search_confidence: decision.search_confidence,
                 tie_gap: decision.tie_gap,
                 leader_action: optional_action_to_i32(decision.leader_action),
                 challenger_action: optional_action_to_i32(decision.challenger_action),

@@ -97,11 +97,13 @@ config = BayesianMCTSConfig(
 )
 mcts = BayesianMCTS(game, config, leaves_per_batch=64)
 policies = mcts.search(states, model)
-stats = mcts.search_stats()  # stop reason, sims used, consensus, tie gap
+stats = mcts.search_stats()  # stop reason, sims used, consensus, search confidence, tie gap
 ```
 
 The consensus stop uses `min(max_a normalize(sqrt(prior_a * w_a)), sum_a sqrt(prior_a * w_a))`,
 so low-overlap prior/search disagreement cannot trigger an early stop.
+`search_confidence` is reported separately as `max_a w_a`, the tree posterior confidence without
+prior gating.
 
 ## Virtual Loss Batching
 

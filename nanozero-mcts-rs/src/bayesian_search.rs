@@ -190,6 +190,7 @@ pub struct BayesianRootDecision {
     pub should_stop: bool,
     pub stop_reason: &'static str,
     pub consensus_score: f32,
+    pub search_confidence: f32,
     pub tie_gap: f32,
     pub leader_action: Option<u16>,
     pub challenger_action: Option<u16>,
@@ -331,6 +332,7 @@ pub fn root_stop_decision(
             should_stop: true,
             stop_reason: "terminal",
             consensus_score: 0.0,
+            search_confidence: 0.0,
             tie_gap: 0.0,
             leader_action: None,
             challenger_action: None,
@@ -354,6 +356,7 @@ pub fn root_stop_decision(
             should_stop: true,
             stop_reason: "forced",
             consensus_score: 1.0,
+            search_confidence: 1.0,
             tie_gap: 0.0,
             leader_action: Some(beliefs[0].action),
             challenger_action: None,
@@ -377,10 +380,12 @@ pub fn root_stop_decision(
 
     let mut pooled_total = 0.0f32;
     let mut pooled_max = 0.0f32;
+    let mut search_confidence = 0.0f32;
     for belief in &beliefs {
         let pooled = (belief.prior.max(0.0) * belief.weight.max(0.0)).sqrt();
         pooled_total += pooled;
         pooled_max = pooled_max.max(pooled);
+        search_confidence = search_confidence.max(belief.weight);
     }
 
     let normalized_consensus = if pooled_total > 1e-10 {
@@ -404,6 +409,7 @@ pub fn root_stop_decision(
         should_stop,
         stop_reason,
         consensus_score,
+        search_confidence,
         tie_gap,
         leader_action: Some(leader.action),
         challenger_action: Some(challenger.action),

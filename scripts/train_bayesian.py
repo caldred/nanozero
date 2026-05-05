@@ -47,6 +47,7 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
     game_examples = [[] for _ in range(n_parallel)]
     search_sims = []
     search_consensus = []
+    search_confidence = []
     search_tie_gaps = []
     stop_reasons = {}
 
@@ -65,6 +66,7 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
         for stat in mcts.search_stats():
             search_sims.append(stat["simulations_used"])
             search_consensus.append(stat["consensus_score"])
+            search_confidence.append(stat["search_confidence"])
             search_tie_gaps.append(stat["tie_gap"])
             reason = stat["stop_reason"]
             stop_reasons[reason] = stop_reasons.get(reason, 0) + 1
@@ -117,6 +119,7 @@ def self_play_games(game, model, mcts, num_games, temperature_threshold=15, para
         print0(
             f"  Search stats: avg_sims={np.mean(search_sims):.1f}, "
             f"avg_consensus={np.mean(search_consensus):.3f}, "
+            f"avg_search_conf={np.mean(search_confidence):.3f}, "
             f"avg_tie_gap={np.mean(search_tie_gaps):.3f}, stops=({reasons})"
         )
 

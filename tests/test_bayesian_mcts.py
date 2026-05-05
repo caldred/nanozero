@@ -92,6 +92,7 @@ class TestBayesianMCTS:
         assert stats[0]["stop_reason"] == "budget"
         assert stats[0]["simulations_used"] == 5
         assert 0.0 <= stats[0]["consensus_score"] <= 1.0
+        assert 0.0 <= stats[0]["search_confidence"] <= 1.0
         assert stats[0]["leader_action"] >= 0
         assert stats[0]["recommended_action"] >= 0
 
